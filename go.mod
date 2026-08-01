@@ -8,6 +8,11 @@ require (
 	modernc.org/sqlite v1.40.0
 )
 
+replace (
+	gochen => ../gochen
+	gochen-iam => ../gochen-iam
+)
+
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
@@ -21,7 +26,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace gochen => ../gochen
-
-replace gochen-iam => ../gochen-iam

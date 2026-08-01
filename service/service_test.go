@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -230,6 +232,156 @@ func TestServiceBuildDefinitionListResponseCountsStatuses(t *testing.T) {
 	}
 	if response.StatusCounts != response.Stats {
 		t.Fatalf("status counts = %#v, want %#v", response.StatusCounts, response.Stats)
+	}
+}
+
+func TestServiceBuildDefinitionListResponseKeepsFullListSemantics(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	service := newTestService(store)
+	for i := 0; i < 21; i++ {
+		design := sampleDesign()
+		design.ID = fmt.Sprintf("definition-%02d", i)
+		if _, err := service.SaveDefinition(ctx, design); err != nil {
+			t.Fatalf("save definition %d: %v", i, err)
+		}
+	}
+
+	response, err := service.BuildDefinitionListResponse(ctx)
+	if err != nil {
+		t.Fatalf("BuildDefinitionListResponse: %v", err)
+	}
+	if response.Total != 21 || len(response.Items) != 21 {
+		t.Fatalf("full list total/items = %d/%d, want 21/21", response.Total, len(response.Items))
+	}
+}
+
+func TestServiceBuildDefinitionListResponseFiltersAndPaginates(t *testing.T) {
+	ctx := context.Background()
+	store := &listOnlyStore{designs: []*workflowtypes.DesignerDefinition{
+		{ID: "draft-a", Name: "Expense approval", Status: workflowtypes.StatusDraft, UpdatedAt: time.Now()},
+		{ID: "draft-b", Name: "Expense review", Status: workflowtypes.StatusDraft, UpdatedAt: time.Now().Add(-time.Minute)},
+		{ID: "published", Name: "Expense published", Status: workflowtypes.StatusPublished, UpdatedAt: time.Now().Add(-2 * time.Minute)},
+		{ID: "other", Name: "Onboarding", Status: workflowtypes.StatusDraft, UpdatedAt: time.Now().Add(-3 * time.Minute)},
+	}}
+	service := newTestService(store)
+
+	response, err := service.BuildDefinitionListResponseWithQuery(ctx, workflowtypes.DefinitionQuery{
+		Page: 1, Size: 1, Keyword: "expense", Status: workflowtypes.StatusDraft,
+	})
+	if err != nil {
+		t.Fatalf("BuildDefinitionListResponseWithQuery: %v", err)
+	}
+	if response.Total != 2 || len(response.Items) != 1 || response.Page != 1 || response.Size != 1 {
+		t.Fatalf("unexpected filtered page: %#v", response)
+	}
+	if response.Stats.Total != 3 || response.Stats.Draft != 2 || response.Stats.Published != 1 {
+		t.Fatalf("keyword-scoped stats = %#v", response.Stats)
+	}
+
+	if _, err := service.BuildDefinitionListResponseWithQuery(ctx, workflowtypes.DefinitionQuery{Status: "unknown"}); !errors.Is(err, errors.InvalidInput) {
+		t.Fatalf("invalid status error = %v, want InvalidInput", err)
+	}
+}
+
+func TestServiceBuildDefinitionListResponseQueriesSQLitePage(t *testing.T) {
+	ctx := scopedContext(t, 1)
+	store, err := OpenSQLiteStore(t.Context(), filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	defer store.Close()
+	service := newTestService(store)
+
+	for _, input := range []struct {
+		id          string
+		name        string
+		description string
+		published   bool
+	}{
+		{id: "draft-a", name: "Expense approval", description: "first expense draft"},
+		{id: "draft-b", name: "Review", description: "second EXPENSE draft"},
+		{id: "published", name: "Expense published", published: true},
+		{id: "other", name: "Onboarding"},
+	} {
+		design := sampleDesign()
+		design.ID = input.id
+		design.Name = input.name
+		design.Description = input.description
+		if _, err := service.SaveDefinition(ctx, design); err != nil {
+			t.Fatalf("save definition %s: %v", input.id, err)
+		}
+		if input.published {
+			if _, err := service.PublishDefinition(ctx, input.id); err != nil {
+				t.Fatalf("publish definition %s: %v", input.id, err)
+			}
+		}
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE workflow_definitions
+		SET updated_at = CASE id
+			WHEN 'draft-b' THEN '2026-05-24T10:03:00.1Z'
+			WHEN 'draft-a' THEN '2026-05-24T10:03:00Z'
+			WHEN 'published' THEN '2026-05-24T10:02:00Z'
+			ELSE '2026-05-24T10:01:00Z'
+		END`); err != nil {
+		t.Fatalf("set deterministic definition ordering: %v", err)
+	}
+
+	response, err := service.BuildDefinitionListResponseWithQuery(ctx, workflowtypes.DefinitionQuery{
+		Page: 2, Size: 1, Keyword: "expense", Status: workflowtypes.StatusDraft,
+	})
+	if err != nil {
+		t.Fatalf("BuildDefinitionListResponseWithQuery: %v", err)
+	}
+	if response.Total != 2 || len(response.Items) != 1 {
+		t.Fatalf("sqlite filtered page total/items = %d/%d, want 2/1", response.Total, len(response.Items))
+	}
+	if response.Page != 2 || response.Items[0].ID != "draft-a" {
+		t.Fatalf("sqlite second page = page %d item %q, want page 2 item draft-a", response.Page, response.Items[0].ID)
+	}
+	if response.Stats.Total != 3 || response.Stats.Draft != 2 || response.Stats.Published != 1 {
+		t.Fatalf("sqlite keyword-scoped stats = %#v", response.Stats)
+	}
+}
+
+func TestServiceBuildDefinitionListResponseRejectsOffsetOverflow(t *testing.T) {
+	service := newTestService(&listOnlyStore{})
+	_, err := service.BuildDefinitionListResponseWithQuery(context.Background(), workflowtypes.DefinitionQuery{
+		Page: math.MaxInt,
+		Size: 100,
+	})
+	if !errors.Is(err, errors.InvalidInput) {
+		t.Fatalf("expected invalid input for overflowing offset, got %v", err)
+	}
+}
+
+func TestServiceInstanceAndWorkItemListsRejectOffsetOverflow(t *testing.T) {
+	service := newTestService(NewMemoryStore())
+	tests := []struct {
+		name string
+		list func() error
+	}{
+		{
+			name: "instances",
+			list: func() error {
+				_, err := service.ListInstances(context.Background(), workflowtypes.InstanceQuery{Page: math.MaxInt, Size: 2})
+				return err
+			},
+		},
+		{
+			name: "work items",
+			list: func() error {
+				_, err := service.ListTodoItemsByQuery(context.Background(), workflowtypes.WorkItemQuery{Page: math.MaxInt, Size: 2})
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.list(); !errors.Is(err, errors.InvalidInput) {
+				t.Fatalf("expected invalid input for overflowing offset, got %v", err)
+			}
+		})
 	}
 }
 
@@ -1293,18 +1445,22 @@ func TestSQLiteStoreMigratesLegacyScopePrimaryKeysWithInstances(t *testing.T) {
 		t.Fatalf("seed legacy schema: %v", err)
 	}
 
-	store, err := OpenSQLiteStore(ctx, dbPath)
+	store, err := OpenSQLiteStore(ctx, dbPath,
+		WithLegacyDataScope(Scope{Kind: ScopeKindTenant, ID: 909}))
 	if err != nil {
 		t.Fatalf("migrate legacy store with instances: %v", err)
 	}
 	defer store.Close()
 	service := newTestService(store)
-	state, err := service.GetInstance(context.Background(), legacyState.ID)
+	state, err := service.GetInstance(scopedContext(t, 909), legacyState.ID)
 	if err != nil {
-		t.Fatalf("legacy platform instance should remain readable: %v", err)
+		t.Fatalf("legacy instance should be readable in assigned scope: %v", err)
 	}
 	if state.DefinitionID != legacyDesign.ID {
 		t.Fatalf("legacy instance definition = %q, want %q", state.DefinitionID, legacyDesign.ID)
+	}
+	if _, err := service.GetInstance(scopedContext(t, 910), legacyState.ID); err == nil || !errors.Is(err, errors.NotFound) {
+		t.Fatalf("legacy instance should remain isolated from other scopes, got %v", err)
 	}
 }
 
@@ -1395,6 +1551,44 @@ func TestSQLiteStoreMigratedLegacyInstancesStillRestrictDefinitionDelete(t *test
 	defer store.Close()
 	if err := store.DeleteDesign(context.Background(), legacyDesign.ID); err == nil {
 		t.Fatal("expected migrated foreign key to restrict deleting a referenced definition")
+	}
+}
+
+func TestSQLiteStoreLegacyScopeMigrationRejectsCollisionsAtomically(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-collision.db")
+	ctx := context.Background()
+	store, err := OpenSQLiteStore(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	service := newTestService(store)
+	if _, err := service.SaveDefinition(ctx, sampleDesign()); err != nil {
+		t.Fatalf("save platform definition: %v", err)
+	}
+	tenantDesign := sampleDesign()
+	tenantDesign.ID = "onboarding"
+	if _, err := service.SaveDefinition(scopedContext(t, 77), tenantDesign); err != nil {
+		t.Fatalf("save tenant definition: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close sqlite store: %v", err)
+	}
+
+	if _, err := OpenSQLiteStore(ctx, dbPath, WithLegacyDataScope(Scope{Kind: ScopeKindTenant, ID: 77})); err == nil || !errors.Is(err, errors.Conflict) {
+		t.Fatalf("legacy scope collision error = %v, want conflict", err)
+	}
+
+	store, err = OpenSQLiteStore(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen sqlite store after rejected migration: %v", err)
+	}
+	defer store.Close()
+	service = newTestService(store)
+	if _, err := service.GetDefinition(ctx, "onboarding"); err != nil {
+		t.Fatalf("platform definition should remain after rejected migration: %v", err)
+	}
+	if _, err := service.GetDefinition(scopedContext(t, 77), "onboarding"); err != nil {
+		t.Fatalf("tenant definition should remain after rejected migration: %v", err)
 	}
 }
 

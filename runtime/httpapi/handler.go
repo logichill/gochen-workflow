@@ -12,6 +12,7 @@ import (
 	workflowpermissions "gochen-workflow/permissions"
 	workflowservice "gochen-workflow/service"
 	workflowtypes "gochen-workflow/types"
+	"gochen/auth"
 	"gochen/errors"
 	"gochen/httpx"
 	runtime "gochen/process/workflow"
@@ -80,11 +81,28 @@ func (r *Registrar) listDefinitions(ctx httpx.IContext) error {
 	if err != nil {
 		return err
 	}
-	response, err := r.service.BuildDefinitionListResponse(serviceCtx)
+	query, err := definitionQuery(ctx)
+	if err != nil {
+		return err
+	}
+	response, err := r.service.BuildDefinitionListResponseWithQuery(serviceCtx, query)
 	if err != nil {
 		return err
 	}
 	return httpx.WriteSuccess(ctx, response)
+}
+
+func definitionQuery(ctx httpx.IContext) (workflowtypes.DefinitionQuery, error) {
+	page, size, err := workItemPageQuery(ctx)
+	if err != nil {
+		return workflowtypes.DefinitionQuery{}, err
+	}
+	return workflowtypes.DefinitionQuery{
+		Page:    page,
+		Size:    size,
+		Keyword: strings.TrimSpace(ctx.Query("keyword")),
+		Status:  workflowtypes.DefinitionStatus(strings.TrimSpace(ctx.Query("status"))),
+	}, nil
 }
 
 func (r *Registrar) createDefinition(ctx httpx.IContext) error {
@@ -196,6 +214,12 @@ func (r *Registrar) createInstance(ctx httpx.IContext) error {
 	if err := ctx.BindJSON(&input); err != nil {
 		return err
 	}
+	principal, err := auth.RequirePrincipal(serviceCtx)
+	if err != nil || principal.SubjectID <= 0 {
+		return errors.NewCode(errors.Unauthorized, "workflow principal is required")
+	}
+	input.InitiatorID = strconv.FormatInt(principal.SubjectID, 10)
+	input.InitiatorName = ""
 	state, err := r.service.CreateInstanceWithOptions(serviceCtx, input)
 	if err != nil {
 		return err

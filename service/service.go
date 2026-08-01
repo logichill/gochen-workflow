@@ -3,6 +3,7 @@ package workflowservice
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -79,6 +80,122 @@ func (s *Service) BuildDefinitionListResponse(ctx context.Context) (*workflowtyp
 		Stats:        stats,
 		StatusCounts: stats,
 	}, nil
+}
+
+// BuildDefinitionListResponseWithQuery 生成经过筛选和分页的定义列表及全量状态统计。
+func (s *Service) BuildDefinitionListResponseWithQuery(ctx context.Context, query workflowtypes.DefinitionQuery) (*workflowtypes.DefinitionListResponse, error) {
+	if err := s.validateReady(ctx); err != nil {
+		return nil, err
+	}
+	page, size, err := normalizeDefinitionPage(query.Page, query.Size)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDefinitionStatus(query.Status); err != nil {
+		return nil, err
+	}
+	normalizedQuery := definitionListQuery{
+		page:    page,
+		size:    size,
+		offset:  (page - 1) * size,
+		keyword: strings.ToLower(strings.TrimSpace(query.Keyword)),
+		status:  query.Status,
+	}
+	if queryStore, ok := s.store.(definitionQueryStore); ok {
+		return queryStore.queryDesigns(ctx, normalizedQuery)
+	}
+
+	items, err := s.ListDefinitions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	keywordItems := filterDefinitionsByKeyword(items, query.Keyword)
+	stats := countDefinitionStats(keywordItems)
+	filtered, err := filterDefinitionsByStatus(keywordItems, query.Status)
+	if err != nil {
+		return nil, err
+	}
+	total := len(filtered)
+	start := normalizedQuery.offset
+	if start >= total {
+		filtered = []*workflowtypes.DesignerDefinition{}
+	} else {
+		end := start + size
+		if end > total {
+			end = total
+		}
+		filtered = filtered[start:end]
+	}
+	return &workflowtypes.DefinitionListResponse{
+		Items:        filtered,
+		Total:        total,
+		Page:         page,
+		Size:         size,
+		Stats:        stats,
+		StatusCounts: stats,
+	}, nil
+}
+
+func normalizeDefinitionPage(page, size int) (int, int, error) {
+	if page == 0 {
+		page = 1
+	}
+	if size == 0 {
+		size = 20
+	}
+	if page < 1 {
+		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow definition page must be greater than 0")
+	}
+	if size < 1 || size > 100 {
+		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow definition size must be between 1 and 100")
+	}
+	if page > 1 && page-1 > math.MaxInt/size {
+		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow definition pagination offset is too large")
+	}
+	return page, size, nil
+}
+
+func filterDefinitionsByKeyword(items []*workflowtypes.DesignerDefinition, rawKeyword string) []*workflowtypes.DesignerDefinition {
+	keyword := strings.ToLower(strings.TrimSpace(rawKeyword))
+	if keyword == "" {
+		return items
+	}
+	filtered := make([]*workflowtypes.DesignerDefinition, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		haystack := strings.ToLower(strings.Join([]string{item.ID, item.Name, item.Description}, " "))
+		if strings.Contains(haystack, keyword) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func filterDefinitionsByStatus(items []*workflowtypes.DesignerDefinition, status workflowtypes.DefinitionStatus) ([]*workflowtypes.DesignerDefinition, error) {
+	if err := validateDefinitionStatus(status); err != nil {
+		return nil, err
+	}
+	if status == "" {
+		return items, nil
+	}
+	filtered := make([]*workflowtypes.DesignerDefinition, 0, len(items))
+	for _, item := range items {
+		if item != nil && item.Status == status {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
+}
+
+func validateDefinitionStatus(status workflowtypes.DefinitionStatus) error {
+	switch status {
+	case "", workflowtypes.StatusDraft, workflowtypes.StatusPublished, workflowtypes.StatusArchived:
+		return nil
+	default:
+		return errors.NewCode(errors.InvalidInput, "workflow definition status is invalid").WithContext("status", status)
+	}
 }
 
 func countDefinitionStats(items []*workflowtypes.DesignerDefinition) workflowtypes.DefinitionStats {
@@ -1670,6 +1787,9 @@ func normalizeWorkItemPage(page int, size int) (int, int, error) {
 	}
 	if size > 100 {
 		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow work item size must not exceed 100")
+	}
+	if page > 1 && page-1 > math.MaxInt/size {
+		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow pagination offset is too large")
 	}
 	return page, size, nil
 }

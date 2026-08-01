@@ -28,6 +28,18 @@ type Store interface {
 	CountInstancesByDefinition(ctx context.Context, id string) (int, error)
 }
 
+type definitionListQuery struct {
+	page    int
+	size    int
+	offset  int
+	keyword string
+	status  workflowtypes.DefinitionStatus
+}
+
+type definitionQueryStore interface {
+	queryDesigns(ctx context.Context, query definitionListQuery) (*workflowtypes.DefinitionListResponse, error)
+}
+
 // MemoryStore 是用于测试和本地开发的内存 workflow 存储。
 type MemoryStore struct {
 	mu      sync.RWMutex
@@ -356,13 +368,34 @@ func (s *MemoryStore) Delete(ctx context.Context, id runtime.ID) error {
 
 // SQLiteStore 是基于 SQLite 的 workflow 持久化存储。
 type SQLiteStore struct {
-	db      *sql.DB
-	managed bool
+	db              *sql.DB
+	managed         bool
+	legacyDataScope *Scope
+}
+
+// SQLiteStoreOption 配置 SQLite workflow 存储初始化。
+type SQLiteStoreOption func(*SQLiteStore) error
+
+// WithLegacyDataScope 将引入 managed scope 前创建的记录显式归属到目标 scope。
+//
+// 未配置时，platform/0 历史记录保持隔离，不会被 HTTP scope 隐式接管。
+func WithLegacyDataScope(scope Scope) SQLiteStoreOption {
+	return func(store *SQLiteStore) error {
+		scope = normalizeScope(scope)
+		if err := validateScope(scope); err != nil {
+			return err
+		}
+		if scope.ID <= 0 {
+			return errors.NewCode(errors.InvalidInput, "workflow legacy data scope id is required")
+		}
+		store.legacyDataScope = &scope
+		return nil
+	}
 }
 
 // NewSQLiteStore 基于外部提供的 *sql.DB 创建 workflow 存储并执行内置迁移。
 // 调用方负责数据库连接的生命周期管理（关闭）。
-func NewSQLiteStore(ctx context.Context, db *sql.DB) (*SQLiteStore, error) {
+func NewSQLiteStore(ctx context.Context, db *sql.DB, options ...SQLiteStoreOption) (*SQLiteStore, error) {
 	if ctx == nil {
 		return nil, errors.NewCode(errors.InvalidInput, "workflow context is nil")
 	}
@@ -370,6 +403,14 @@ func NewSQLiteStore(ctx context.Context, db *sql.DB) (*SQLiteStore, error) {
 		return nil, errors.NewCode(errors.InvalidInput, "workflow db is nil")
 	}
 	store := &SQLiteStore{db: db, managed: false}
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		if err := option(store); err != nil {
+			return nil, err
+		}
+	}
 	if err := store.Migrate(ctx); err != nil {
 		return nil, err
 	}
@@ -378,7 +419,7 @@ func NewSQLiteStore(ctx context.Context, db *sql.DB) (*SQLiteStore, error) {
 
 // OpenSQLiteStore 打开 SQLite workflow 存储并执行内置迁移。
 // Deprecated: 推荐使用 NewSQLiteStore 接收外部数据库连接。
-func OpenSQLiteStore(ctx context.Context, dsn string) (*SQLiteStore, error) {
+func OpenSQLiteStore(ctx context.Context, dsn string, options ...SQLiteStoreOption) (*SQLiteStore, error) {
 	if ctx == nil {
 		return nil, errors.NewCode(errors.InvalidInput, "workflow context is nil")
 	}
@@ -391,6 +432,15 @@ func OpenSQLiteStore(ctx context.Context, dsn string) (*SQLiteStore, error) {
 	}
 	db.SetMaxOpenConns(1)
 	store := &SQLiteStore{db: db, managed: true}
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		if err := option(store); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	if err := store.Migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -433,7 +483,68 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 	if err := s.ensureScopedPrimaryKeys(ctx); err != nil {
 		return err
 	}
+	if s.legacyDataScope != nil {
+		if err := s.migrateLegacyDataScope(ctx, *s.legacyDataScope); err != nil {
+			return err
+		}
+	}
 	return s.ensureScopeIndexes(ctx)
+}
+
+func (s *SQLiteStore) migrateLegacyDataScope(ctx context.Context, target Scope) (err error) {
+	target = normalizeScope(target)
+	if err := validateScope(target); err != nil {
+		return err
+	}
+	if target.ID <= 0 {
+		return errors.NewCode(errors.InvalidInput, "workflow legacy data scope id is required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.Wrap(err, errors.Database, "begin workflow legacy scope migration")
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err = tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
+		return errors.Wrap(err, errors.Database, "defer workflow foreign keys for legacy scope migration")
+	}
+
+	for _, table := range []string{"workflow_definitions", "workflow_instances"} {
+		var conflict int
+		query := `SELECT EXISTS(
+			SELECT 1 FROM ` + table + ` legacy
+			JOIN ` + table + ` target ON target.id = legacy.id
+			WHERE legacy.managed_scope_kind = 'platform' AND legacy.managed_scope_id = 0
+				AND target.managed_scope_kind = ? AND target.managed_scope_id = ?
+		)`
+		if scanErr := tx.QueryRowContext(ctx, query, target.Kind, target.ID).Scan(&conflict); scanErr != nil {
+			return errors.Wrap(scanErr, errors.Database, "check workflow legacy scope conflicts").
+				WithContext("table", table)
+		}
+		if conflict != 0 {
+			return errors.NewCode(errors.Conflict, "workflow legacy data conflicts with target scope").
+				WithContext("table", table).
+				WithContext("scope_kind", target.Kind).
+				WithContext("scope_id", target.ID)
+		}
+	}
+
+	for _, table := range []string{"workflow_definitions", "workflow_instances"} {
+		if _, err = tx.ExecContext(ctx, `UPDATE `+table+`
+			SET managed_scope_kind = ?, managed_scope_id = ?
+			WHERE managed_scope_kind = 'platform' AND managed_scope_id = 0`, target.Kind, target.ID); err != nil {
+			return errors.Wrap(err, errors.Database, "assign workflow legacy data scope").
+				WithContext("table", table)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return errors.Wrap(err, errors.Database, "commit workflow legacy scope migration")
+	}
+	return nil
 }
 
 func (s *SQLiteStore) ensureInstanceVersionColumn(ctx context.Context) error {
@@ -642,6 +753,99 @@ func (s *SQLiteStore) ListDesigns(ctx context.Context) ([]*workflowtypes.Designe
 		return nil, errors.Wrap(err, errors.Database, "iterate workflow definitions")
 	}
 	return items, nil
+}
+
+func (s *SQLiteStore) queryDesigns(ctx context.Context, query definitionListQuery) (*workflowtypes.DefinitionListResponse, error) {
+	scope, err := currentManagedScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	where := "managed_scope_kind = ? AND managed_scope_id = ?"
+	baseArgs := []any{scope.Kind, scope.ID}
+	if query.keyword != "" {
+		where += " AND instr(lower(id || ' ' || name || ' ' || COALESCE(json_extract(graph_json, '$.description'), '')), ?) > 0"
+		baseArgs = append(baseArgs, query.keyword)
+	}
+
+	stats := workflowtypes.DefinitionStats{}
+	rows, err := s.db.QueryContext(ctx, "SELECT status, COUNT(1) FROM workflow_definitions WHERE "+where+" GROUP BY status", baseArgs...)
+	if err != nil {
+		return nil, errors.Wrap(err, errors.Database, "count workflow definition statuses")
+	}
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			_ = rows.Close()
+			return nil, errors.Wrap(err, errors.Database, "scan workflow definition status count")
+		}
+		stats.Total += count
+		switch workflowtypes.DefinitionStatus(status) {
+		case workflowtypes.StatusDraft:
+			stats.Draft += count
+		case workflowtypes.StatusPublished:
+			stats.Published += count
+		case workflowtypes.StatusArchived:
+			stats.Archived += count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, errors.Wrap(err, errors.Database, "iterate workflow definition status counts")
+	}
+	if err := rows.Close(); err != nil {
+		return nil, errors.Wrap(err, errors.Database, "close workflow definition status counts")
+	}
+
+	filteredWhere := where
+	filteredArgs := append([]any(nil), baseArgs...)
+	total := stats.Total
+	if query.status != "" {
+		filteredWhere += " AND status = ?"
+		filteredArgs = append(filteredArgs, string(query.status))
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM workflow_definitions WHERE "+filteredWhere, filteredArgs...).Scan(&total); err != nil {
+			return nil, errors.Wrap(err, errors.Database, "count filtered workflow definitions")
+		}
+	}
+
+	pageArgs := append(append([]any(nil), filteredArgs...), query.size, query.offset)
+	pageRows, err := s.db.QueryContext(ctx,
+		"SELECT graph_json, runtime_definition_json FROM workflow_definitions WHERE "+filteredWhere+` ORDER BY
+			substr(updated_at, 1, 19) DESC,
+			CASE
+				WHEN instr(updated_at, '.') > 0 THEN substr(
+					substr(updated_at, instr(updated_at, '.') + 1, instr(updated_at, 'Z') - instr(updated_at, '.') - 1) || '000000000',
+					1,
+					9
+				)
+				ELSE '000000000'
+			END DESC,
+			id ASC LIMIT ? OFFSET ?`,
+		pageArgs...,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, errors.Database, "query workflow definition page")
+	}
+	defer pageRows.Close()
+	items := make([]*workflowtypes.DesignerDefinition, 0, query.size)
+	for pageRows.Next() {
+		design, err := scanDesignRows(pageRows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, design)
+	}
+	if err := pageRows.Err(); err != nil {
+		return nil, errors.Wrap(err, errors.Database, "iterate workflow definition page")
+	}
+	return &workflowtypes.DefinitionListResponse{
+		Items:        items,
+		Total:        total,
+		Page:         query.page,
+		Size:         query.size,
+		Stats:        stats,
+		StatusCounts: stats,
+	}, nil
 }
 
 func (s *SQLiteStore) GetDesign(ctx context.Context, id string) (*workflowtypes.DesignerDefinition, error) {

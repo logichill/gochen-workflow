@@ -37,6 +37,8 @@ go run ./cmd/gochen-workflow
 独立服务默认挂载 `gochen-iam` 鉴权中间件；除 health/ping 等跳过路径外，API 请求需要携带 `Authorization: Bearer <token>`。
 本地联调时应保证 token 由相同 `AUTH_SECRET` 签发，并包含 `active_scope_id` 与对应 API 权限；独立服务会将 `active_scope_id` 作为当前租户级 scope。宿主模块接入时，HTTP 层会把 IAM active scope 映射为 workflow service scope，service/store 只按轻量 scope 上下文做数据隔离。
 
+旧版本未启用 scope 的 SQLite 数据会迁移到 `platform/0`，不会被任何 HTTP tenant 自动认领。确认数据归属后，使用 `GOCHEN_WORKFLOW_LEGACY_SCOPE_ID=<positive-id>` 启动一次服务，将这些记录原子迁移到当前 `GOCHEN_WORKFLOW_SCOPE_KIND`（未设置时为 `tenant`）和指定 ID；目标 scope 已存在同 ID 记录时迁移会失败并回滚。
+
 权限码：
 
 - `api:workflow:read`：读取流程定义与实例。
@@ -90,7 +92,7 @@ host.WithModuleHTTP("workflow", host.ModuleHTTPConfig{Prefix: "/workflows"})
 
 响应统一使用 GoChen `httpx.ResponseMessage`，业务数据位于 `data`；实例响应使用 snake_case DTO，不直接暴露核心 runtime 结构体字段。
 列表分页统一使用 `page/size`，不支持 `page_size`。`/todos`、`/done`、`/started` 和 `/instances` 是当前 scope 监控视角；`/my/*` 按当前 `Principal.SubjectID` 过滤个人发起、待办和已办。
-创建实例可传 `business_key`、`title`、`initiator_id`、`initiator_name`、`assignee_id`、`assignee_name`、`candidate_user_ids`、`candidate_role_ids`、`cc_user_ids`、`due_at` 与 `data`。
+创建实例可传 `business_key`、`title`、`assignee_id`、`assignee_name`、`candidate_user_ids`、`candidate_role_ids`、`cc_user_ids`、`due_at` 与 `data`。HTTP 请求中的 `initiator_id`/`initiator_name` 会被忽略，发起人始终取认证 `Principal.SubjectID`；可信内部 service 调用可通过 `CreateInstanceWithOptions` 显式指定发起人。
 推进分支节点时，请求体可传 `{"next_node_id":"approved"}` 显式选择单一后继；不传请求体或传空对象时按 runtime 默认 fan-out 推进。完成、认领、取消认领、转办、委托、催办、抄送和撤回请求体可传 `comment`；完成、转办和委托还可传下一处理人字段和 `due_at`。转办/委托未传 `due_at` 时继承原任务到期时间。
 
 ## 验证

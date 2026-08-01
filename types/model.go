@@ -99,8 +99,18 @@ type DefinitionStats struct {
 type DefinitionListResponse struct {
 	Items        []*DesignerDefinition `json:"items"`
 	Total        int                   `json:"total"`
+	Page         int                   `json:"page"`
+	Size         int                   `json:"size"`
 	Stats        DefinitionStats       `json:"stats"`
 	StatusCounts DefinitionStats       `json:"status_counts"`
+}
+
+// DefinitionQuery 表示流程定义列表的筛选与分页条件。
+type DefinitionQuery struct {
+	Page    int
+	Size    int
+	Keyword string
+	Status  DefinitionStatus
 }
 
 // RuntimeNode 是 HTTP 响应中用于预览 runtime 投影的节点 DTO。

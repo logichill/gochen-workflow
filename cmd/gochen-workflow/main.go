@@ -36,9 +36,6 @@ func main() {
 
 func run(ctx context.Context, logger logging.ILogger) error {
 	installStandaloneAuthContextResolver()
-	if err := iammw.ValidateAuthConfig(nil); err != nil {
-		return errors.Wrap(err, errors.Internal, "workflow auth config validation failed")
-	}
 
 	startupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -60,13 +57,30 @@ func run(ctx context.Context, logger logging.ILogger) error {
 			logger.Warn(ctx, "close workflow database failed", logging.Error(err))
 		}
 	}()
+	revokedTokenStore, err := iammw.NewDatabaseRevokedTokenStore(database)
+	if err != nil {
+		return errors.Wrap(err, errors.Internal, "create workflow token revocation store")
+	}
+	if err := iammw.InstallDefaultRevokedTokenStore(revokedTokenStore); err != nil {
+		return errors.Wrap(err, errors.Internal, "install workflow token revocation store")
+	}
+	if err := iammw.ValidateAuthConfig(nil); err != nil {
+		return errors.Wrap(err, errors.Internal, "workflow auth config validation failed")
+	}
+	if err := iammw.EnsureDatabaseRevokedTokenSchema(startupCtx, database); err != nil {
+		return errors.Wrap(err, errors.Database, "initialize workflow token revocation schema")
+	}
 
 	sqlDB, ok := stdsql.DBOf(database)
 	if !ok {
 		return errors.NewCode(errors.Internal, "workflow database does not expose *sql.DB")
 	}
 
-	store, err := workflowservice.NewSQLiteStore(startupCtx, sqlDB)
+	storeOptions, err := sqliteStoreOptionsFromEnv()
+	if err != nil {
+		return err
+	}
+	store, err := workflowservice.NewSQLiteStore(startupCtx, sqlDB, storeOptions...)
 	if err != nil {
 		return errors.Wrap(err, errors.Database, "open workflow store")
 	}
@@ -99,6 +113,26 @@ func run(ctx context.Context, logger logging.ILogger) error {
 		host.WithModules(workflow.NewModule),
 		host.WithFailFastOnRouteConflicts(true),
 	)
+}
+
+// sqliteStoreOptionsFromEnv 将历史无 scope 数据显式绑定到 standalone 服务配置的 scope。
+func sqliteStoreOptionsFromEnv() ([]workflowservice.SQLiteStoreOption, error) {
+	scopeKind, err := standaloneScopeKind()
+	if err != nil {
+		return nil, err
+	}
+	rawID := strings.TrimSpace(os.Getenv("GOCHEN_WORKFLOW_LEGACY_SCOPE_ID"))
+	if rawID == "" {
+		return nil, nil
+	}
+	scopeID, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || scopeID <= 0 {
+		return nil, errors.NewCode(errors.InvalidInput, "invalid workflow legacy scope id").
+			WithContext("scope_id", rawID)
+	}
+	return []workflowservice.SQLiteStoreOption{
+		workflowservice.WithLegacyDataScope(workflowservice.Scope{Kind: scopeKind, ID: scopeID}),
+	}, nil
 }
 
 func listenAddress(raw string) (string, int, error) {
@@ -153,20 +187,27 @@ func (standaloneAuthContextResolver) ResolveAuthContext(_ context.Context, claim
 	if claims == nil || claims.ActiveScopeID <= 0 {
 		return nil, errors.NewCode(errors.Unauthorized, "active scope is required")
 	}
+	scopeKind, err := standaloneScopeKind()
+	if err != nil {
+		return nil, err
+	}
 	return &iammw.ResolvedAuthContext{
 		ActiveScopeID:   claims.ActiveScopeID,
-		ActiveScopeKind: standaloneScopeKind(),
+		ActiveScopeKind: scopeKind,
 		VisibleScopeIDs: []int64{claims.ActiveScopeID},
 	}, nil
 }
 
 // standaloneScopeKind 决定 standalone 模式的作用域类型。
 // JWTClaims 不携带 scope kind，故由 GOCHEN_WORKFLOW_SCOPE_KIND 显式配置，默认 tenant。
-func standaloneScopeKind() string {
+func standaloneScopeKind() (string, error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOCHEN_WORKFLOW_SCOPE_KIND"))) {
 	case string(iammw.ScopePlatform):
-		return string(iammw.ScopePlatform)
+		return string(iammw.ScopePlatform), nil
+	case "", string(iammw.ScopeTenant):
+		return string(iammw.ScopeTenant), nil
 	default:
-		return string(iammw.ScopeTenant)
+		return "", errors.NewCode(errors.InvalidInput, "invalid workflow scope kind").
+			WithContext("scope_kind", os.Getenv("GOCHEN_WORKFLOW_SCOPE_KIND"))
 	}
 }

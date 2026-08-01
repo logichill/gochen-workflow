@@ -74,6 +74,56 @@ func TestRegistrarDefinitionAndInstanceAPI(t *testing.T) {
 	}
 }
 
+func TestRegistrarCreateInstanceUsesAuthenticatedPrincipal(t *testing.T) {
+	service := workflowservice.NewService(workflowservice.NewMemoryStore(), nil, nil)
+	handlers := registerTestRoutes(t, NewRegistrar(service))
+	payload := map[string]any{
+		"id":            "principal-definition",
+		"name":          "Principal Definition",
+		"start_node_id": "start",
+		"nodes": []map[string]any{
+			{"id": "start", "name": "Start", "next": []string{"end"}, "position": map[string]any{"x": 0, "y": 0}},
+			{"id": "end", "name": "End", "position": map[string]any{"x": 120, "y": 0}},
+		},
+		"edges": []map[string]any{{"id": "principal-edge", "source": "start", "target": "end"}},
+	}
+	if resp := doJSON(t, handlers["POST /definitions"], nil, payload); resp.Code != http.StatusCreated {
+		t.Fatalf("create definition status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if resp := doJSON(t, handlers["POST /definitions/:id/publish"], map[string]string{"id": "principal-definition"}, nil); resp.Code != http.StatusOK {
+		t.Fatalf("publish definition status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	resp := doJSONAsUser(t, handlers["POST /instances"], nil, map[string]any{
+		"id":             "principal-instance",
+		"definition_id":  "principal-definition",
+		"initiator_id":   "9999",
+		"initiator_name": "forged name",
+	}, 1001)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create instance status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	var state workflowtypes.InstanceState
+	decodeResponseData(t, resp, &state)
+	if state.InitiatorID != "1001" || state.InitiatorName != "" {
+		t.Fatalf("initiator = %q/%q, want authenticated id and empty untrusted name", state.InitiatorID, state.InitiatorName)
+	}
+
+	unauthenticatedReq := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"definition_id":"principal-definition"}`))
+	unauthenticatedResp := httptest.NewRecorder()
+	httpCtx, err := nethttp.NewBaseContext(unauthenticatedResp, unauthenticatedReq)
+	if err != nil {
+		t.Fatalf("new unauthenticated context: %v", err)
+	}
+	httpCtx.SetContext(httpCtx.RequestContext().WithContext(
+		iamauth.BindActiveScopeContext(httpCtx.RequestContext(), 1, workflowservice.ScopeKindTenant)))
+	if err := handlers["POST /instances"](httpCtx); err != nil {
+		_ = nethttp.WriteErrorResponse(httpCtx, err)
+	}
+	if unauthenticatedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated create status = %d body=%s", unauthenticatedResp.Code, unauthenticatedResp.Body.String())
+	}
+}
+
 func TestRegistrarListDefinitionsIncludesStatusStats(t *testing.T) {
 	service := workflowservice.NewService(workflowservice.NewMemoryStore(), nil, nil)
 	handlers := registerTestRoutes(t, NewRegistrar(service))
@@ -129,6 +179,24 @@ func TestRegistrarListDefinitionsIncludesStatusStats(t *testing.T) {
 	}
 	if list.StatusCounts != list.Stats {
 		t.Fatalf("status_counts = %#v, want %#v", list.StatusCounts, list.Stats)
+	}
+
+	filteredResp := doGet(t, handlers["GET /definitions"], "/?page=1&size=1&keyword=flow&status=draft")
+	if filteredResp.Code != http.StatusOK {
+		t.Fatalf("filtered list status = %d body=%s", filteredResp.Code, filteredResp.Body.String())
+	}
+	var filtered workflowtypes.DefinitionListResponse
+	decodeResponseData(t, filteredResp, &filtered)
+	if filtered.Total != 1 || len(filtered.Items) != 1 || filtered.Items[0].ID != "draft-flow" || filtered.Page != 1 || filtered.Size != 1 {
+		t.Fatalf("unexpected filtered definition page: %#v", filtered)
+	}
+	if filtered.Stats.Total != 3 {
+		t.Fatalf("keyword-scoped stats total = %d, want 3", filtered.Stats.Total)
+	}
+
+	unsupportedResp := doGet(t, handlers["GET /definitions"], "/?page_size=1")
+	if unsupportedResp.Code != http.StatusBadRequest {
+		t.Fatalf("page_size status = %d body=%s", unsupportedResp.Code, unsupportedResp.Body.String())
 	}
 }
 
@@ -389,13 +457,13 @@ func TestRegistrarMyStartedIgnoresInitiatorOverride(t *testing.T) {
 		t.Fatalf("publish status = %d body=%s", resp.Code, resp.Body.String())
 	}
 
-	createAndStart := func(instanceID, initiatorID string) {
+	createAndStart := func(instanceID string, initiatorID int64) {
 		t.Helper()
-		if resp := doJSON(t, handlers["POST /instances"], nil, map[string]any{
+		if resp := doJSONAsUser(t, handlers["POST /instances"], nil, map[string]any{
 			"id":            instanceID,
 			"definition_id": "approval-my-started",
-			"initiator_id":  initiatorID,
-		}); resp.Code != http.StatusCreated {
+			"initiator_id":  "9999",
+		}, initiatorID); resp.Code != http.StatusCreated {
 			t.Fatalf("instance status = %d body=%s", resp.Code, resp.Body.String())
 		}
 		if resp := doJSON(t, handlers["POST /instances/:id/start"], map[string]string{"id": instanceID}, nil); resp.Code != http.StatusOK {
@@ -403,8 +471,8 @@ func TestRegistrarMyStartedIgnoresInitiatorOverride(t *testing.T) {
 		}
 	}
 
-	createAndStart("inst-my-started-self", "1001")
-	createAndStart("inst-my-started-other", "3003")
+	createAndStart("inst-my-started-self", 1001)
+	createAndStart("inst-my-started-other", 3003)
 
 	resp := doGetAsUser(t, handlers["GET /my/started"], "/?page=1&size=20&initiator_id=3003", 1001)
 	if resp.Code != http.StatusOK {
@@ -1051,6 +1119,7 @@ func TestRegistrarAppliesPermissionMiddlewareGroups(t *testing.T) {
 }
 
 func TestRegistrarPermissionMiddlewareBehavior(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	service := workflowservice.NewService(workflowservice.NewMemoryStore(), nil, nil)
 	group := &middlewareGroup{
 		handlers: map[string]httpx.Handler{},
@@ -1179,7 +1248,13 @@ func doRequestWithScope(t *testing.T, handler httpx.Handler, params map[string]s
 		t.Fatalf("new context: %v", err)
 	}
 	if scopeID > 0 || strings.TrimSpace(scopeKind) != "" {
-		ctx.SetContext(ctx.RequestContext().WithContext(iamauth.BindActiveScopeContext(ctx.RequestContext(), scopeID, scopeKind)))
+		reqCtx := iamauth.BindActiveScopeContext(ctx.RequestContext(), scopeID, scopeKind)
+		var principalErr error
+		reqCtx, principalErr = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: 1001, ActiveScopeID: scopeID})
+		if principalErr != nil {
+			t.Fatalf("with principal: %v", principalErr)
+		}
+		ctx.SetContext(ctx.RequestContext().WithContext(reqCtx))
 	}
 	for key, value := range params {
 		ctx.SetParam(key, value)

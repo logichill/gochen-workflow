@@ -51,7 +51,32 @@ func TestListenAddressRejectsInvalidPorts(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreOptionsFromEnvRequiresPositiveLegacyScopeID(t *testing.T) {
+	t.Setenv("GOCHEN_WORKFLOW_LEGACY_SCOPE_ID", "invalid")
+	if _, err := sqliteStoreOptionsFromEnv(); err == nil {
+		t.Fatal("expected invalid legacy scope id to fail")
+	}
+
+	t.Setenv("GOCHEN_WORKFLOW_LEGACY_SCOPE_ID", "42")
+	t.Setenv("GOCHEN_WORKFLOW_SCOPE_KIND", "tenant")
+	options, err := sqliteStoreOptionsFromEnv()
+	if err != nil {
+		t.Fatalf("sqliteStoreOptionsFromEnv returned error: %v", err)
+	}
+	if len(options) != 1 {
+		t.Fatalf("store options = %d, want 1", len(options))
+	}
+}
+
+func TestSQLiteStoreOptionsFromEnvRejectsInvalidScopeKind(t *testing.T) {
+	t.Setenv("GOCHEN_WORKFLOW_SCOPE_KIND", "tennat")
+	if _, err := sqliteStoreOptionsFromEnv(); err == nil {
+		t.Fatal("expected invalid workflow scope kind to fail")
+	}
+}
+
 func TestInstallStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	previous := iammw.ResolveInstalledAuthContextResolver()
 	t.Cleanup(func() { iammw.InstallAuthContextResolver(previous) })
 
@@ -101,6 +126,7 @@ func TestWorkflowStandaloneAuthConfigRequiresSecret(t *testing.T) {
 }
 
 func TestStandaloneRouteMiddlewaresAuthenticateBeforePermissions(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
 	t.Setenv("AUTH_SECRET", "workflow-test-secret")
 	previous := iammw.ResolveInstalledAuthContextResolver()
 	t.Cleanup(func() { iammw.InstallAuthContextResolver(previous) })
