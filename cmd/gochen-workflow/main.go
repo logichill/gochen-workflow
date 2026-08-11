@@ -19,6 +19,7 @@ import (
 	dibasic "gochen/di/basic"
 	"gochen/errors"
 	"gochen/host"
+	hostconfig "gochen/host/config"
 	"gochen/httpx"
 	"gochen/ident"
 	"gochen/logging"
@@ -89,7 +90,7 @@ func run(ctx context.Context, logger logging.ILogger) error {
 	if err := di.RegisterInstance[workflowservice.Store](container, store); err != nil {
 		return errors.Wrap(err, errors.Internal, "register workflow store")
 	}
-	if err := di.RegisterInstance[ident.IGenerator[string]](container, ident.DefaultStringGenerator()); err != nil {
+	if err := di.RegisterInstance[ident.IGenerator[string]](container, ident.NewUUIDGenerator()); err != nil {
 		return errors.Wrap(err, errors.Internal, "register workflow id generator")
 	}
 	if err := di.RegisterInstance[clock.IClock](container, clock.NewRealClock()); err != nil {
@@ -102,16 +103,16 @@ func run(ctx context.Context, logger logging.ILogger) error {
 	}
 
 	return host.Run(ctx,
-		host.WithName("gochen-workflow"),
-		host.WithLogger(logger),
-		host.WithContainer(container),
-		host.WithAddress(hostName),
-		host.WithPort(port),
-		host.WithBasePath("/api/v1"),
-		host.WithRouteMiddlewares(standaloneRouteMiddlewares()...),
-		host.WithModuleHTTP("workflow", host.ModuleHTTPConfig{Prefix: "/workflows"}),
-		host.WithModules(workflow.NewModule),
-		host.WithFailFastOnRouteConflicts(true),
+		hostconfig.WithName("gochen-workflow"),
+		hostconfig.WithLogger(logger),
+		hostconfig.WithContainer(container),
+		hostconfig.WithAddress(hostName),
+		hostconfig.WithPort(port),
+		hostconfig.WithBasePath("/api/v1"),
+		hostconfig.WithRouteMiddlewares(standaloneRouteMiddlewares(logger)...),
+		hostconfig.WithModuleHTTP("workflow", hostconfig.ModuleHTTPConfig{Prefix: "/workflows"}),
+		hostconfig.WithModules(workflow.NewModule),
+		hostconfig.WithFailFastOnRouteConflicts(true),
 	)
 }
 
@@ -173,8 +174,11 @@ func parseWorkflowPort(portText string, rawAddr string) (int, error) {
 	return port, nil
 }
 
-func standaloneRouteMiddlewares() []httpx.Middleware {
-	return []httpx.Middleware{iammw.AuthMiddleware(nil)}
+func standaloneRouteMiddlewares(logger logging.ILogger) []httpx.Middleware {
+	return []httpx.Middleware{
+		iammw.AuditMiddleware(logger, nil),
+		iammw.AuthMiddleware(nil),
+	}
 }
 
 type standaloneAuthContextResolver struct{}

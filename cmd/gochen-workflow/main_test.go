@@ -12,6 +12,7 @@ import (
 	auth "gochen/auth"
 	"gochen/httpx"
 	"gochen/httpx/nethttp"
+	"gochen/logging"
 )
 
 func TestListenAddressParsesSupportedForms(t *testing.T) {
@@ -132,7 +133,7 @@ func TestStandaloneRouteMiddlewaresAuthenticateBeforePermissions(t *testing.T) {
 	t.Cleanup(func() { iammw.InstallAuthContextResolver(previous) })
 
 	installStandaloneAuthContextResolver()
-	middlewares := standaloneRouteMiddlewares()
+	middlewares := standaloneRouteMiddlewares(logging.NewNoopLogger())
 	if len(middlewares) == 0 {
 		t.Fatal("expected standalone route middlewares")
 	}

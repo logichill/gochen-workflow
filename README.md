@@ -53,9 +53,10 @@ go run ./cmd/gochen-workflow
 
 ```go
 import workflow "gochen-workflow"
+import hostconfig "gochen/host/config"
 
-host.WithModules(workflow.NewModule)
-host.WithModuleHTTP("workflow", host.ModuleHTTPConfig{Prefix: "/workflows"})
+hostconfig.WithModules(workflow.NewModule)
+hostconfig.WithModuleHTTP("workflow", hostconfig.ModuleHTTPConfig{Prefix: "/workflows"})
 ```
 
 模块依赖 `service.Store`、`ident.IGenerator[string]` 与 `clock.IClock`，由宿主通过 GoChen DI 注入。当前仓库的 [`go.mod`](/home/alex/data/priv/project/gochen-workflow/go.mod) 通过 `replace` 指向相邻工作区 `../gochen` 与 `../gochen-iam`；若脱离该 mono-workspace 单独使用，需要改成可解析的模块来源。

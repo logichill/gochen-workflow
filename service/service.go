@@ -35,7 +35,7 @@ type Service struct {
 // NewService 创建 workflow 应用服务。
 func NewService(store Store, idGenerator ident.IGenerator[string], clk clock.IClock) *Service {
 	if idGenerator == nil {
-		idGenerator = ident.DefaultStringGenerator()
+		idGenerator = ident.NewUUIDGenerator()
 	}
 	if clk == nil {
 		clk = clock.NewRealClock()
