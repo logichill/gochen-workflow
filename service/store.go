@@ -16,6 +16,8 @@ import (
 )
 
 // Store 定义 workflow 服务需要的设计态与运行态持久化能力。
+// SaveDefinition 的显式版本必须高于当前最大版本，0 表示自动分配下一版本；
+// SaveDesign 则按设计版本逐次递增。已保存的版本不能覆盖。
 type Store interface {
 	runtime.IStore
 	runtime.IOptimisticStore
@@ -42,18 +44,24 @@ type definitionQueryStore interface {
 
 // MemoryStore 是用于测试和本地开发的内存 workflow 存储。
 type MemoryStore struct {
-	mu      sync.RWMutex
-	designs map[scopedDefinitionKey]*workflowtypes.DesignerDefinition
-	runtime map[scopedDefinitionKey]*runtime.Definition
-	states  map[scopedInstanceKey]*runtime.State
+	mu              sync.RWMutex
+	designs         map[scopedDefinitionKey]*workflowtypes.DesignerDefinition
+	designVersions  map[scopedDefinitionKey]map[uint32]*workflowtypes.DesignerDefinition
+	runtime         map[scopedDefinitionKey]*runtime.Definition
+	runtimeVersions map[scopedDefinitionKey]map[uint32]*runtime.Definition
+	latestVersions  map[scopedDefinitionKey]uint32
+	states          map[scopedInstanceKey]*runtime.State
 }
 
 // NewMemoryStore 创建内存 workflow 存储。
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		designs: map[scopedDefinitionKey]*workflowtypes.DesignerDefinition{},
-		runtime: map[scopedDefinitionKey]*runtime.Definition{},
-		states:  map[scopedInstanceKey]*runtime.State{},
+		designs:         map[scopedDefinitionKey]*workflowtypes.DesignerDefinition{},
+		designVersions:  map[scopedDefinitionKey]map[uint32]*workflowtypes.DesignerDefinition{},
+		runtime:         map[scopedDefinitionKey]*runtime.Definition{},
+		runtimeVersions: map[scopedDefinitionKey]map[uint32]*runtime.Definition{},
+		latestVersions:  map[scopedDefinitionKey]uint32{},
+		states:          map[scopedInstanceKey]*runtime.State{},
 	}
 }
 
@@ -135,6 +143,9 @@ func (s *MemoryStore) SaveDesign(ctx context.Context, design *workflowtypes.Desi
 			WithContext("definition_id", design.ID).
 			WithContext("runtime_definition_id", runtimeDef.ID)
 	}
+	if runtimeDef.Version != 0 && runtimeDef.Version != uint32(design.Version) {
+		return errors.NewCode(errors.InvalidInput, "workflow design and runtime version mismatch")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key, err := scopedDefinition(ctx, design.ID)
@@ -162,7 +173,24 @@ func (s *MemoryStore) SaveDesign(ctx context.Context, design *workflowtypes.Desi
 	if err != nil {
 		return err
 	}
+	ver := uint32(design.Version)
+	if runtimeDef.Version > 0 {
+		ver = runtimeDef.Version
+	} else {
+		runtimeDef.Version = ver
+	}
 	s.runtime[runtimeKey] = cloneRuntimeDefinition(runtimeDef)
+	if s.runtimeVersions[runtimeKey] == nil {
+		s.runtimeVersions[runtimeKey] = map[uint32]*runtime.Definition{}
+	}
+	s.runtimeVersions[runtimeKey][ver] = cloneRuntimeDefinition(runtimeDef)
+	if s.designVersions[runtimeKey] == nil {
+		s.designVersions[runtimeKey] = map[uint32]*workflowtypes.DesignerDefinition{}
+	}
+	s.designVersions[runtimeKey][ver] = cloneDesign(design)
+	if ver > s.latestVersions[runtimeKey] {
+		s.latestVersions[runtimeKey] = ver
+	}
 	return nil
 }
 
@@ -174,7 +202,10 @@ func (s *MemoryStore) DeleteDesign(ctx context.Context, id string) error {
 		return err
 	}
 	delete(s.designs, key)
+	delete(s.designVersions, key)
 	delete(s.runtime, key)
+	delete(s.runtimeVersions, key)
+	delete(s.latestVersions, key)
 	return nil
 }
 
@@ -231,12 +262,31 @@ func (s *MemoryStore) ListStartedInstances(ctx context.Context) ([]*runtime.Stat
 	return items, nil
 }
 
-func (s *MemoryStore) GetDefinition(ctx context.Context, id string) (*runtime.Definition, error) {
+func (s *MemoryStore) GetDefinition(ctx context.Context, id string, version uint32) (*runtime.Definition, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	key, err := scopedDefinition(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if version > 0 {
+		if verMap, ok := s.runtimeVersions[key]; ok {
+			if def, ok := verMap[version]; ok {
+				return cloneRuntimeDefinition(def), nil
+			}
+		}
+		if def, ok := s.runtime[key]; ok && def.Version == version {
+			return cloneRuntimeDefinition(def), nil
+		}
+		return nil, nil
+	}
+	if verMap, ok := s.runtimeVersions[key]; ok {
+		latest := s.latestVersions[key]
+		if latest > 0 {
+			if def, ok := verMap[latest]; ok {
+				return cloneRuntimeDefinition(def), nil
+			}
+		}
 	}
 	if def, ok := s.runtime[key]; ok {
 		return cloneRuntimeDefinition(def), nil
@@ -259,6 +309,13 @@ func (s *MemoryStore) SaveDefinition(ctx context.Context, def *runtime.Definitio
 		now = time.Now().UTC()
 	}
 	design := designFromRuntimeDefinition(def, now)
+	ver := def.Version
+	if ver == 0 {
+		ver = s.latestVersions[key] + 1
+	}
+	if ver == 0 || ver <= s.latestVersions[key] {
+		return errors.NewCode(errors.Conflict, "workflow definition version must exceed latest version")
+	}
 	if existing := s.designs[key]; existing != nil {
 		design.Description = existing.Description
 		design.Version = existing.Version + 1
@@ -274,19 +331,65 @@ func (s *MemoryStore) SaveDefinition(ctx context.Context, def *runtime.Definitio
 			design.PublishedAt = &publishedAt
 		}
 	}
+	design.Version = int(ver)
+	def.Version = ver
 	s.designs[key] = cloneDesign(design)
+	if s.designVersions[key] == nil {
+		s.designVersions[key] = map[uint32]*workflowtypes.DesignerDefinition{}
+	}
+	s.designVersions[key][ver] = cloneDesign(design)
 	s.runtime[key] = cloneRuntimeDefinition(def)
+	if s.runtimeVersions[key] == nil {
+		s.runtimeVersions[key] = map[uint32]*runtime.Definition{}
+	}
+	s.runtimeVersions[key][ver] = cloneRuntimeDefinition(def)
+	if ver > s.latestVersions[key] {
+		s.latestVersions[key] = ver
+	}
 	return nil
 }
 
-func (s *MemoryStore) DeleteDefinition(ctx context.Context, id string) error {
+func (s *MemoryStore) DeleteDefinition(ctx context.Context, id string, version uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key, err := scopedDefinition(ctx, id)
 	if err != nil {
 		return err
 	}
-	delete(s.runtime, key)
+	if version == 0 {
+		delete(s.runtime, key)
+		delete(s.runtimeVersions, key)
+		delete(s.latestVersions, key)
+		delete(s.designs, key)
+		delete(s.designVersions, key)
+		return nil
+	}
+	if verMap, ok := s.runtimeVersions[key]; ok {
+		delete(verMap, version)
+		delete(s.designVersions[key], version)
+		if len(verMap) == 0 {
+			delete(s.runtimeVersions, key)
+			delete(s.latestVersions, key)
+			delete(s.runtime, key)
+			delete(s.designs, key)
+			delete(s.designVersions, key)
+		} else if s.latestVersions[key] == version {
+			var newMax uint32
+			for v := range verMap {
+				if v > newMax {
+					newMax = v
+				}
+			}
+			s.latestVersions[key] = newMax
+			if def, ok := verMap[newMax]; ok {
+				s.runtime[key] = cloneRuntimeDefinition(def)
+			}
+			// 设计态同步回退，否则 GetDesign 仍会返回已删除版本（SQLite 侧回写主表）。
+			if design, ok := s.designVersions[key][newMax]; ok {
+				s.designs[key] = cloneDesign(design)
+			}
+		}
+	}
 	return nil
 }
 
@@ -464,6 +567,7 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 	}
 	statements := []string{
 		createWorkflowDefinitionsTable("workflow_definitions"),
+		createWorkflowDefinitionVersionsTable("workflow_definition_versions"),
 		createWorkflowInstancesTable("workflow_instances"),
 	}
 	for _, statement := range statements {
@@ -483,12 +587,144 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 	if err := s.ensureScopedPrimaryKeys(ctx); err != nil {
 		return err
 	}
+	if err := s.upgradeLegacyDefinitionJSONs(ctx); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO workflow_definition_versions
+		(managed_scope_kind, managed_scope_id, id, version, runtime_definition_json, graph_json, created_at)
+		SELECT managed_scope_kind, managed_scope_id, id, version, runtime_definition_json, graph_json, updated_at
+		FROM workflow_definitions WHERE version > 0`); err != nil {
+		return errors.Wrap(err, errors.Database, "migrate workflow definition versions")
+	}
+	// 存量实例没有 definition_version（读出为 0 即"跟随最新版"）；把它们钉到主表当时的版本，
+	// 否则之后一发布新版本，运行中的老实例会静默切到新图，当前节点若被删掉就再也推进不了。
+	if _, err := s.db.ExecContext(ctx, `UPDATE workflow_instances
+		SET state_json = json_set(state_json, '$.definition_version',
+			(SELECT d.version FROM workflow_definitions d
+			 WHERE d.managed_scope_kind = workflow_instances.managed_scope_kind
+			   AND d.managed_scope_id = workflow_instances.managed_scope_id
+			   AND d.id = workflow_instances.definition_id))
+		WHERE COALESCE(json_extract(state_json, '$.definition_version'), 0) = 0
+		  AND EXISTS (SELECT 1 FROM workflow_definitions d
+			 WHERE d.managed_scope_kind = workflow_instances.managed_scope_kind
+			   AND d.managed_scope_id = workflow_instances.managed_scope_id
+			   AND d.id = workflow_instances.definition_id)`); err != nil {
+		return errors.Wrap(err, errors.Database, "pin legacy workflow instances to definition version")
+	}
 	if s.legacyDataScope != nil {
 		if err := s.migrateLegacyDataScope(ctx, *s.legacyDataScope); err != nil {
 			return err
 		}
 	}
 	return s.ensureScopeIndexes(ctx)
+}
+
+// upgradeLegacyDefinitionJSONs 把存量定义里旧版 next 出边就地升级为 edges 结构。
+// 必须在版本表回填之前执行，保证回填快照与后续加载拿到的都是升级后的定义。
+func (s *SQLiteStore) upgradeLegacyDefinitionJSONs(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT managed_scope_kind, managed_scope_id, id, runtime_definition_json FROM workflow_definitions`)
+	if err != nil {
+		return errors.Wrap(err, errors.Database, "scan workflow definitions for legacy upgrade")
+	}
+	type pendingUpgrade struct {
+		kind    string
+		scopeID int64
+		id      string
+		json    string
+	}
+	var pending []pendingUpgrade
+	for rows.Next() {
+		var item pendingUpgrade
+		if err := rows.Scan(&item.kind, &item.scopeID, &item.id, &item.json); err != nil {
+			_ = rows.Close()
+			return errors.Wrap(err, errors.Database, "read workflow definition for legacy upgrade")
+		}
+		upgraded, changed, err := upgradeLegacyRuntimeDefinitionJSON(item.json)
+		if err != nil {
+			_ = rows.Close()
+			return errors.Wrap(err, errors.Database, "upgrade legacy workflow definition").
+				WithContext("definition_id", item.id)
+		}
+		if changed {
+			item.json = upgraded
+			pending = append(pending, item)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return errors.Wrap(err, errors.Database, "close workflow definition scan")
+	}
+	for _, item := range pending {
+		if _, err := s.db.ExecContext(ctx, `UPDATE workflow_definitions
+			SET runtime_definition_json = ?
+			WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`,
+			item.json, item.kind, item.scopeID, item.id); err != nil {
+			return errors.Wrap(err, errors.Database, "persist upgraded workflow definition").
+				WithContext("definition_id", item.id)
+		}
+	}
+	return nil
+}
+
+// upgradeLegacyRuntimeDefinitionJSON 将旧版节点上的 "next": ["target", ...] 出边
+// 转换为现行 "edges": [{"target": ...}] 结构，并移除 next 字段。
+// 节点已有非空 edges 时保留 edges、只清理 next。
+func upgradeLegacyRuntimeDefinitionJSON(raw string) (string, bool, error) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		return raw, false, errors.Wrap(err, errors.InvalidInput, "decode legacy workflow definition")
+	}
+	nodesRaw, ok := doc["nodes"]
+	if !ok {
+		return raw, false, nil
+	}
+	var nodes []map[string]json.RawMessage
+	if err := json.Unmarshal(nodesRaw, &nodes); err != nil {
+		return raw, false, errors.Wrap(err, errors.InvalidInput, "decode legacy workflow definition nodes")
+	}
+	changed := false
+	for _, node := range nodes {
+		nextRaw, hasNext := node["next"]
+		if !hasNext {
+			continue
+		}
+		var targets []string
+		if err := json.Unmarshal(nextRaw, &targets); err != nil {
+			return raw, false, errors.Wrap(err, errors.InvalidInput, "decode legacy workflow node next")
+		}
+		delete(node, "next")
+		changed = true
+		if len(targets) == 0 {
+			continue
+		}
+		if edgesRaw, hasEdges := node["edges"]; hasEdges {
+			var existing []json.RawMessage
+			if err := json.Unmarshal(edgesRaw, &existing); err == nil && len(existing) > 0 {
+				continue
+			}
+		}
+		edges := make([]runtime.Edge, 0, len(targets))
+		for _, target := range targets {
+			edges = append(edges, runtime.Edge{Target: target})
+		}
+		encoded, err := json.Marshal(edges)
+		if err != nil {
+			return raw, false, errors.Wrap(err, errors.Internal, "encode upgraded workflow node edges")
+		}
+		node["edges"] = encoded
+	}
+	if !changed {
+		return raw, false, nil
+	}
+	encodedNodes, err := json.Marshal(nodes)
+	if err != nil {
+		return raw, false, errors.Wrap(err, errors.Internal, "encode upgraded workflow definition nodes")
+	}
+	doc["nodes"] = encodedNodes
+	upgraded, err := json.Marshal(doc)
+	if err != nil {
+		return raw, false, errors.Wrap(err, errors.Internal, "encode upgraded workflow definition")
+	}
+	return string(upgraded), true, nil
 }
 
 func (s *SQLiteStore) migrateLegacyDataScope(ctx context.Context, target Scope) (err error) {
@@ -513,11 +749,16 @@ func (s *SQLiteStore) migrateLegacyDataScope(ctx context.Context, target Scope) 
 		return errors.Wrap(err, errors.Database, "defer workflow foreign keys for legacy scope migration")
 	}
 
-	for _, table := range []string{"workflow_definitions", "workflow_instances"} {
+	tables := []string{"workflow_definitions", "workflow_definition_versions", "workflow_instances"}
+	for _, table := range tables {
 		var conflict int
+		versionMatch := ""
+		if table == "workflow_definition_versions" {
+			versionMatch = " AND target.version = legacy.version"
+		}
 		query := `SELECT EXISTS(
 			SELECT 1 FROM ` + table + ` legacy
-			JOIN ` + table + ` target ON target.id = legacy.id
+			JOIN ` + table + ` target ON target.id = legacy.id` + versionMatch + `
 			WHERE legacy.managed_scope_kind = 'platform' AND legacy.managed_scope_id = 0
 				AND target.managed_scope_kind = ? AND target.managed_scope_id = ?
 		)`
@@ -533,7 +774,7 @@ func (s *SQLiteStore) migrateLegacyDataScope(ctx context.Context, target Scope) 
 		}
 	}
 
-	for _, table := range []string{"workflow_definitions", "workflow_instances"} {
+	for _, table := range tables {
 		if _, err = tx.ExecContext(ctx, `UPDATE `+table+`
 			SET managed_scope_kind = ?, managed_scope_id = ?
 			WHERE managed_scope_kind = 'platform' AND managed_scope_id = 0`, target.Kind, target.ID); err != nil {
@@ -595,6 +836,19 @@ func createWorkflowDefinitionsTable(table string) string {
 		updated_at TEXT NOT NULL,
 		published_at TEXT,
 		PRIMARY KEY (managed_scope_kind, managed_scope_id, id)
+	)`
+}
+
+func createWorkflowDefinitionVersionsTable(table string) string {
+	return `CREATE TABLE IF NOT EXISTS ` + table + ` (
+		managed_scope_kind TEXT NOT NULL DEFAULT 'platform',
+		managed_scope_id INTEGER NOT NULL DEFAULT 0,
+		id TEXT NOT NULL,
+		version INTEGER NOT NULL,
+		runtime_definition_json TEXT NOT NULL,
+		graph_json TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY (managed_scope_kind, managed_scope_id, id, version)
 	)`
 }
 
@@ -862,6 +1116,14 @@ func (s *SQLiteStore) GetDesign(ctx context.Context, id string) (*workflowtypes.
 }
 
 func (s *SQLiteStore) SaveDesign(ctx context.Context, design *workflowtypes.DesignerDefinition, runtimeDef *runtime.Definition) error {
+	if design == nil {
+		return errors.NewCode(errors.InvalidInput, "workflow design is required")
+	}
+	return s.saveDesign(ctx, design, runtimeDef, design.Version-1)
+}
+
+// saveDesign 使用读取到的最新版本做 CAS，运行态允许显式跳号，设计态仍逐版保存。
+func (s *SQLiteStore) saveDesign(ctx context.Context, design *workflowtypes.DesignerDefinition, runtimeDef *runtime.Definition, expectedVersion int) error {
 	if design == nil || runtimeDef == nil {
 		return errors.NewCode(errors.InvalidInput, "workflow design and runtime definition are required")
 	}
@@ -874,6 +1136,11 @@ func (s *SQLiteStore) SaveDesign(ctx context.Context, design *workflowtypes.Desi
 		return errors.NewCode(errors.InvalidInput, "workflow definition version is invalid").
 			WithContext("definition_id", design.ID).
 			WithContext("version", design.Version)
+	}
+	if runtimeDef.Version == 0 {
+		runtimeDef.Version = uint32(design.Version)
+	} else if runtimeDef.Version != uint32(design.Version) {
+		return errors.NewCode(errors.InvalidInput, "workflow design and runtime version mismatch")
 	}
 	graphJSON, err := json.Marshal(design)
 	if err != nil {
@@ -888,8 +1155,14 @@ func (s *SQLiteStore) SaveDesign(ctx context.Context, design *workflowtypes.Desi
 		return err
 	}
 	publishedAt := nullableTime(design.PublishedAt)
-	if design.Version == 1 {
-		result, err := s.db.ExecContext(ctx, `INSERT INTO workflow_definitions
+	if expectedVersion == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return errors.Wrap(err, errors.Database, "begin save workflow definition transaction")
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		result, err := tx.ExecContext(ctx, `INSERT INTO workflow_definitions
 			(managed_scope_kind, managed_scope_id, id, name, version, status, graph_json, runtime_definition_json, created_at, updated_at, published_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(managed_scope_kind, managed_scope_id, id) DO NOTHING`,
@@ -898,23 +1171,36 @@ func (s *SQLiteStore) SaveDesign(ctx context.Context, design *workflowtypes.Desi
 			return errors.Wrap(err, errors.Database, "save workflow definition")
 		}
 		if affected, _ := result.RowsAffected(); affected > 0 {
-			return nil
+			if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO workflow_definition_versions
+				(managed_scope_kind, managed_scope_id, id, version, runtime_definition_json, graph_json, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				scope.Kind, scope.ID, design.ID, design.Version, string(runtimeJSON), string(graphJSON), formatTime(design.UpdatedAt)); err != nil {
+				return errors.Wrap(err, errors.Database, "save workflow definition version")
+			}
+			return tx.Commit()
 		}
-		currentVersion, exists, err := s.workflowDefinitionVersion(ctx, design.ID, scope)
+
+		var currentVersion uint32
+		err = tx.QueryRowContext(ctx, `SELECT version FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, design.ID).Scan(&currentVersion)
 		if err != nil {
-			return err
-		}
-		if !exists {
-			return errors.NewCode(errors.Conflict, "workflow definition does not exist").
-				WithContext("definition_id", design.ID)
+			if err == sql.ErrNoRows {
+				return errors.NewCode(errors.Conflict, "workflow definition does not exist").
+					WithContext("definition_id", design.ID)
+			}
+			return errors.Wrap(err, errors.Database, "query current workflow definition version")
 		}
 		return errors.NewCode(errors.Conflict, "workflow definition already exists").
 			WithContext("definition_id", design.ID).
 			WithContext("current_version", currentVersion)
 	}
 
-	expectedVersion := design.Version - 1
-	result, err := s.db.ExecContext(ctx, `UPDATE workflow_definitions SET
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.Wrap(err, errors.Database, "begin save workflow definition transaction")
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `UPDATE workflow_definitions SET
 		name = ?,
 		version = ?,
 		status = ?,
@@ -928,15 +1214,23 @@ func (s *SQLiteStore) SaveDesign(ctx context.Context, design *workflowtypes.Desi
 		return errors.Wrap(err, errors.Database, "save workflow definition")
 	}
 	if affected, _ := result.RowsAffected(); affected > 0 {
-		return nil
+		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO workflow_definition_versions
+			(managed_scope_kind, managed_scope_id, id, version, runtime_definition_json, graph_json, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			scope.Kind, scope.ID, design.ID, design.Version, string(runtimeJSON), string(graphJSON), formatTime(design.UpdatedAt)); err != nil {
+			return errors.Wrap(err, errors.Database, "save workflow definition version")
+		}
+		return tx.Commit()
 	}
-	currentVersion, exists, err := s.workflowDefinitionVersion(ctx, design.ID, scope)
+
+	var currentVersion uint32
+	err = tx.QueryRowContext(ctx, `SELECT version FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, design.ID).Scan(&currentVersion)
 	if err != nil {
-		return err
-	}
-	if !exists {
-		return errors.NewCode(errors.Conflict, "workflow definition does not exist").
-			WithContext("definition_id", design.ID)
+		if err == sql.ErrNoRows {
+			return errors.NewCode(errors.Conflict, "workflow definition does not exist").
+				WithContext("definition_id", design.ID)
+		}
+		return errors.Wrap(err, errors.Database, "query current workflow definition version")
 	}
 	return errors.NewCode(errors.Conflict, "workflow definition version mismatch").
 		WithContext("definition_id", design.ID).
@@ -949,11 +1243,19 @@ func (s *SQLiteStore) DeleteDesign(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, id)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return errors.Wrap(err, errors.Database, "begin delete workflow design transaction")
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, id); err != nil {
 		return errors.Wrap(err, errors.Database, "delete workflow definition")
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `DELETE FROM workflow_definition_versions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, id); err != nil {
+		return errors.Wrap(err, errors.Database, "delete workflow definition versions")
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) CountInstancesByDefinition(ctx context.Context, id string) (int, error) {
@@ -1001,18 +1303,40 @@ func (s *SQLiteStore) listInstancesWhere(ctx context.Context, extraWhere string)
 	return items, nil
 }
 
-func (s *SQLiteStore) GetDefinition(ctx context.Context, id string) (*runtime.Definition, error) {
+func (s *SQLiteStore) GetDefinition(ctx context.Context, id string, version uint32) (*runtime.Definition, error) {
 	scope, err := currentManagedScope(ctx)
 	if err != nil {
 		return nil, err
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT runtime_definition_json FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, id)
 	var raw string
-	if err := row.Scan(&raw); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
+	if version > 0 {
+		row := s.db.QueryRowContext(ctx, `SELECT runtime_definition_json FROM workflow_definition_versions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ? AND version = ?`, scope.Kind, scope.ID, id, version)
+		if err := row.Scan(&raw); err == nil {
+			var def runtime.Definition
+			if err := json.Unmarshal([]byte(raw), &def); err != nil {
+				return nil, errors.Wrap(err, errors.Database, "decode runtime definition")
+			}
+			return &def, nil
+		} else if err != sql.ErrNoRows {
+			return nil, errors.Wrap(err, errors.Database, "get runtime definition version")
 		}
-		return nil, errors.Wrap(err, errors.Database, "get runtime definition")
+
+		// 版本表没有命中时回落主表：主表当前版本恰好等于所求版本的记录也算命中。
+		row = s.db.QueryRowContext(ctx, `SELECT runtime_definition_json FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ? AND version = ?`, scope.Kind, scope.ID, id, version)
+		if err := row.Scan(&raw); err != nil {
+			if err == sql.ErrNoRows {
+				return nil, nil
+			}
+			return nil, errors.Wrap(err, errors.Database, "get runtime definition")
+		}
+	} else {
+		row := s.db.QueryRowContext(ctx, `SELECT runtime_definition_json FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, id)
+		if err := row.Scan(&raw); err != nil {
+			if err == sql.ErrNoRows {
+				return nil, nil
+			}
+			return nil, errors.Wrap(err, errors.Database, "get runtime definition")
+		}
 	}
 	var def runtime.Definition
 	if err := json.Unmarshal([]byte(raw), &def); err != nil {
@@ -1034,7 +1358,9 @@ func (s *SQLiteStore) SaveDefinition(ctx context.Context, def *runtime.Definitio
 	if err != nil {
 		return err
 	}
+	expectedVersion := 0
 	if existing != nil {
+		expectedVersion = existing.Version
 		design.Description = existing.Description
 		design.Version = existing.Version + 1
 		if design.Version <= 0 {
@@ -1052,11 +1378,84 @@ func (s *SQLiteStore) SaveDefinition(ctx context.Context, def *runtime.Definitio
 			design.PublishedAt = &publishedAt
 		}
 	}
-	return s.SaveDesign(ctx, design, def)
+	if def.Version != 0 {
+		design.Version = int(def.Version)
+	}
+	if design.Version <= expectedVersion {
+		return errors.NewCode(errors.Conflict, "workflow definition version must exceed latest version")
+	}
+	return s.saveDesign(ctx, design, def, expectedVersion)
 }
 
-func (s *SQLiteStore) DeleteDefinition(ctx context.Context, id string) error {
-	return s.DeleteDesign(ctx, id)
+func (s *SQLiteStore) DeleteDefinition(ctx context.Context, id string, version uint32) error {
+	if version == 0 {
+		return s.DeleteDesign(ctx, id)
+	}
+	scope, err := currentManagedScope(ctx)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.Wrap(err, errors.Database, "begin delete definition version transaction")
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `DELETE FROM workflow_definition_versions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ? AND version = ?`, scope.Kind, scope.ID, id, version)
+	if err != nil {
+		return errors.Wrap(err, errors.Database, "delete workflow definition version")
+	}
+
+	var currentMainVersion uint32
+	err = tx.QueryRowContext(ctx, `SELECT version FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, id).Scan(&currentMainVersion)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return tx.Commit()
+		}
+		return errors.Wrap(err, errors.Database, "query workflow definition main version")
+	}
+
+	// 如果删除的是当前主表指向的最新版本，需重算最新版本或清理主表
+	if currentMainVersion == version {
+		var newMaxVersion uint32
+		var newRuntimeJSON, newGraphJSON string
+		err = tx.QueryRowContext(ctx, `SELECT version, runtime_definition_json, graph_json FROM workflow_definition_versions
+			WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?
+			ORDER BY version DESC LIMIT 1`, scope.Kind, scope.ID, id).Scan(&newMaxVersion, &newRuntimeJSON, &newGraphJSON)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				// 已无任何版本，删除主表
+				if _, err := tx.ExecContext(ctx, `DELETE FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, id); err != nil {
+					return errors.Wrap(err, errors.Database, "delete empty workflow definition")
+				}
+				return tx.Commit()
+			}
+			return errors.Wrap(err, errors.Database, "query next latest workflow definition version")
+		}
+
+		// 回写新的最新版本到主表：name/status/published_at 只存在于 graph_json 中，
+		// 不一并回写会让主表留下被删版本的元数据。
+		var newDesign workflowtypes.DesignerDefinition
+		if err := json.Unmarshal([]byte(newGraphJSON), &newDesign); err != nil {
+			return errors.Wrap(err, errors.Database, "decode workflow design of next version")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE workflow_definitions SET
+			name = ?,
+			version = ?,
+			status = ?,
+			runtime_definition_json = ?,
+			graph_json = ?,
+			updated_at = ?,
+			published_at = ?
+			WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`,
+			newDesign.Name, newMaxVersion, string(newDesign.Status), newRuntimeJSON, newGraphJSON,
+			formatTime(newDesign.UpdatedAt), nullableTime(newDesign.PublishedAt),
+			scope.Kind, scope.ID, id); err != nil {
+			return errors.Wrap(err, errors.Database, "update workflow definition to next version")
+		}
+	}
+
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) Get(ctx context.Context, id runtime.ID) (*runtime.State, error) {
@@ -1213,18 +1612,6 @@ func (s *SQLiteStore) workflowInstanceVersion(ctx context.Context, tx *sql.Tx, i
 	return 0, false, errors.Wrap(err, errors.Database, "get workflow instance version")
 }
 
-func (s *SQLiteStore) workflowDefinitionVersion(ctx context.Context, id string, scope Scope) (int, bool, error) {
-	var version int
-	err := s.db.QueryRowContext(ctx, `SELECT version FROM workflow_definitions WHERE managed_scope_kind = ? AND managed_scope_id = ? AND id = ?`, scope.Kind, scope.ID, id).Scan(&version)
-	if err == nil {
-		return version, true, nil
-	}
-	if err == sql.ErrNoRows {
-		return 0, false, nil
-	}
-	return 0, false, errors.Wrap(err, errors.Database, "get workflow definition version")
-}
-
 func (s *SQLiteStore) Delete(ctx context.Context, id runtime.ID) error {
 	scope, err := currentManagedScope(ctx)
 	if err != nil {
@@ -1313,15 +1700,16 @@ func designFromRuntimeDefinition(def *runtime.Definition, now time.Time) *workfl
 		design.CreatedAt = now
 	}
 	for i, node := range def.Nodes {
+		nextNodes := node.NextNodes()
 		design.Nodes = append(design.Nodes, workflowtypes.DesignerNode{
 			ID:       node.ID,
 			Name:     node.Name,
 			Type:     workflowtypes.NodeKind(node.Kind),
-			Next:     cloneStrings(node.Next),
+			Next:     cloneStrings(nextNodes),
 			RejectTo: cloneStrings(node.RejectTo),
 			Position: workflowtypes.Position{X: float64(i * 180), Y: 0},
 		})
-		for _, next := range node.Next {
+		for _, next := range nextNodes {
 			design.Edges = append(design.Edges, workflowtypes.DesignerEdge{
 				ID:     "edge-" + strconv.Itoa(len(design.Edges)+1),
 				Source: node.ID,

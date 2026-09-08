@@ -41,11 +41,11 @@ go run ./cmd/gochen-workflow
 
 权限码：
 
-- `api:workflow:read`：读取流程定义与实例。
-- `api:workflow:design`：创建、更新、发布、归档与删除流程定义。
-- `api:workflow:run`：创建、启动、推进、认领、转办、委托、催办、抄送与撤回流程实例。
-- `menu:workflow.list:view`：查看流程管理菜单入口。
-- `menu:workflow.designer:view`：查看流程设计器菜单入口。
+- `workflow:api:read`：读取流程定义与实例。
+- `workflow:api:design`：创建、更新、发布、归档与删除流程定义。
+- `workflow:api:run`：创建、启动、推进、认领、转办、委托、催办、抄送与撤回流程实例。
+- `workflow.list:menu:view`：查看流程管理菜单入口。
+- `workflow.designer:menu:view`：查看流程设计器菜单入口。
 
 ## 接入
 

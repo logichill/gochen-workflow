@@ -16,9 +16,9 @@ import (
 
 	iamauth "gochen-iam/auth"
 	iammw "gochen-iam/middleware"
-	"gochen/auth"
+	auth "gochen-runtime/host/authz"
+	"gochen-runtime/http/nethttp"
 	"gochen/httpx"
-	"gochen/httpx/nethttp"
 )
 
 func TestRegistrarDefinitionAndInstanceAPI(t *testing.T) {

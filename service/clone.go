@@ -1,6 +1,8 @@
 package workflowservice
 
 import (
+	"time"
+
 	"gochen-workflow/internal/jsonclone"
 	workflowtypes "gochen-workflow/types"
 
@@ -74,6 +76,7 @@ func cloneRuntimeDefinition(def *runtime.Definition) *runtime.Definition {
 	}
 	clone := &runtime.Definition{
 		ID:          def.ID,
+		Version:     def.Version,
 		Name:        def.Name,
 		StartNodeID: def.StartNodeID,
 		CreatedAt:   def.CreatedAt,
@@ -82,8 +85,11 @@ func cloneRuntimeDefinition(def *runtime.Definition) *runtime.Definition {
 	if def.Nodes != nil {
 		clone.Nodes = make([]runtime.Node, len(def.Nodes))
 		for i := range def.Nodes {
-			clone.Nodes[i] = runtime.Node{ID: def.Nodes[i].ID, Name: def.Nodes[i].Name, Kind: def.Nodes[i].Kind}
-			clone.Nodes[i].Next = cloneStrings(def.Nodes[i].Next)
+			clone.Nodes[i] = def.Nodes[i]
+			if def.Nodes[i].Edges != nil {
+				clone.Nodes[i].Edges = make([]runtime.Edge, len(def.Nodes[i].Edges))
+				copy(clone.Nodes[i].Edges, def.Nodes[i].Edges)
+			}
 			clone.Nodes[i].RejectTo = cloneStrings(def.Nodes[i].RejectTo)
 		}
 	}
@@ -95,16 +101,18 @@ func cloneState(st *runtime.State) *runtime.State {
 		return nil
 	}
 	clone := &runtime.State{
-		ID:            st.ID,
-		DefinitionID:  st.DefinitionID,
-		Version:       st.Version,
-		Status:        st.Status,
-		CurrentNodeID: st.CurrentNodeID,
-		StartedAt:     st.StartedAt,
-		CompletedAt:   st.CompletedAt,
-		CreatedAt:     st.CreatedAt,
-		UpdatedAt:     st.UpdatedAt,
+		ID:                  st.ID,
+		DefinitionID:        st.DefinitionID,
+		DefinitionVersion:   st.DefinitionVersion,
+		Version:             st.Version,
+		Status:              st.Status,
+		ActiveNodeStartedAt: cloneTimeMap(st.ActiveNodeStartedAt),
+		StartedAt:           st.StartedAt,
+		CompletedAt:         st.CompletedAt,
+		CreatedAt:           st.CreatedAt,
+		UpdatedAt:           st.UpdatedAt,
 	}
+
 	clone.ActiveNodeIDs = cloneStrings(st.ActiveNodeIDs)
 	clone.CompletedNodeIDs = cloneStrings(st.CompletedNodeIDs)
 	if st.PendingJoins != nil {
@@ -120,6 +128,17 @@ func cloneState(st *runtime.State) *runtime.State {
 	}
 	clone.Data = cloneMap(st.Data)
 	return clone
+}
+
+func cloneTimeMap(m map[string]time.Time) map[string]time.Time {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]time.Time, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 func cloneMap(values map[string]any) map[string]any {

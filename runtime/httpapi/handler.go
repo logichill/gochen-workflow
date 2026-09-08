@@ -9,10 +9,10 @@ import (
 
 	iamauth "gochen-iam/auth"
 	iammw "gochen-iam/middleware"
+	auth "gochen-runtime/host/authz"
 	workflowpermissions "gochen-workflow/permissions"
 	workflowservice "gochen-workflow/service"
 	workflowtypes "gochen-workflow/types"
-	"gochen/auth"
 	"gochen/errors"
 	"gochen/httpx"
 	runtime "gochen/process/workflow"

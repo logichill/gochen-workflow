@@ -2,15 +2,15 @@ package permissions
 
 import (
 	iammw "gochen-iam/middleware"
-	"gochen/auth"
+	auth "gochen-runtime/host/authz"
 )
 
 const (
-	WorkflowReadCode         = "api:workflow:read"
-	WorkflowDesignCode       = "api:workflow:design"
-	WorkflowRunCode          = "api:workflow:run"
-	WorkflowMenuListCode     = "menu:workflow.list:view"
-	WorkflowMenuDesignerCode = "menu:workflow.designer:view"
+	WorkflowReadCode         = "workflow:api:read"
+	WorkflowDesignCode       = "workflow:api:design"
+	WorkflowRunCode          = "workflow:api:run"
+	WorkflowMenuListCode     = "workflow.list:menu:view"
+	WorkflowMenuDesignerCode = "workflow.designer:menu:view"
 )
 
 var (

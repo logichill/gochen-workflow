@@ -12,10 +12,10 @@ import (
 
 	workflowtypes "gochen-workflow/types"
 
-	"gochen/auth"
+	auth "gochen-runtime/host/authz"
 	"gochen/clock"
 	"gochen/errors"
-	"gochen/ident"
+	"gochen/gen"
 	runtime "gochen/process/workflow"
 )
 
@@ -26,16 +26,16 @@ const systemInitiatorID = "system"
 type Service struct {
 	store       Store
 	engine      *runtime.Engine
-	idGenerator ident.IGenerator[string]
+	idGenerator gen.IGenerator[string]
 	clock       clock.IClock
 
 	definitionMu sync.Mutex
 }
 
 // NewService 创建 workflow 应用服务。
-func NewService(store Store, idGenerator ident.IGenerator[string], clk clock.IClock) *Service {
+func NewService(store Store, idGenerator gen.IGenerator[string], clk clock.IClock) *Service {
 	if idGenerator == nil {
-		idGenerator = ident.NewUUIDGenerator()
+		idGenerator = gen.NewUUIDGenerator()
 	}
 	if clk == nil {
 		clk = clock.NewRealClock()
@@ -216,7 +216,10 @@ func countDefinitionStats(items []*workflowtypes.DesignerDefinition) workflowtyp
 	return stats
 }
 
-// GetDefinition 按 ID 查询设计态定义。
+// GetDefinition 按 ID 查询当前最新的设计态流程定义。
+//
+// 说明：底层的 Store 契约支持按指定版本读取（GetDefinition(ctx, id, version)）；
+// 应用服务层与面向前端的 HTTP 接口默认管理并操作最新生效的设计态定义。
 func (s *Service) GetDefinition(ctx context.Context, id string) (*workflowtypes.DesignerDefinition, error) {
 	if err := s.validateReady(ctx); err != nil {
 		return nil, err
@@ -1045,7 +1048,6 @@ func (s *Service) WithdrawInstance(ctx context.Context, id runtime.ID, input wor
 func applyWithdrawState(st *runtime.State, now time.Time) {
 	st.Status = withdrawnInstanceStatus
 	st.ActiveNodeIDs = []string{}
-	st.CurrentNodeID = ""
 	st.PendingJoins = []runtime.PendingJoin{}
 	st.CompletedAt = now
 	st.History = append(st.History, runtime.HistoryEntry{Action: "withdraw", At: now})
@@ -1618,6 +1620,10 @@ func metadataHasAssignee(meta workflowtypes.InstanceMetadata, assigneeID string)
 
 func (s *Service) instanceSummaryFromState(st *runtime.State, definitions map[string]definitionMeta) workflowtypes.InstanceSummary {
 	meta := metadataFromState(st)
+	var currentNodeID string
+	if len(st.ActiveNodeIDs) > 0 {
+		currentNodeID = st.ActiveNodeIDs[0]
+	}
 	out := workflowtypes.InstanceSummary{
 		ID:             string(st.ID),
 		DefinitionID:   st.DefinitionID,
@@ -1626,7 +1632,7 @@ func (s *Service) instanceSummaryFromState(st *runtime.State, definitions map[st
 		Title:          meta.Title,
 		Status:         st.Status,
 		ActiveNodeIDs:  cloneStrings(st.ActiveNodeIDs),
-		CurrentNodeID:  st.CurrentNodeID,
+		CurrentNodeID:  currentNodeID,
 		InitiatorID:    meta.InitiatorID,
 		InitiatorName:  meta.InitiatorName,
 		AssigneeIDs:    activeAssigneeIDs(st, meta),

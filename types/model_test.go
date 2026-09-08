@@ -427,7 +427,7 @@ func TestToRuntimeDefinitionDoesNotShareNextSlices(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToRuntimeDefinition returned error: %v", err)
 	}
-	runtimeDef.Nodes[0].Next[0] = "mutated"
+	runtimeDef.Nodes[0].Edges[0].Target = "mutated"
 
 	if got := definition.Nodes[0].Next[0]; got != "end" {
 		t.Fatalf("designer next was mutated through runtime projection: %q", got)
@@ -440,8 +440,8 @@ func TestRuntimeDefinitionFromRuntimePreservesRuntimeNodeKindWithoutDesign(t *te
 		Name:        "Runtime Kind",
 		StartNodeID: "review",
 		Nodes: []runtime.Node{
-			{ID: "review", Name: "Review", Kind: runtime.NodeKindBranch, Next: []string{"approved", "manager_review"}},
-			{ID: "manager_review", Name: "Manager Review", Kind: runtime.NodeKindTask, Next: []string{"approved"}},
+			{ID: "review", Name: "Review", Kind: runtime.NodeKindBranch, Edges: []runtime.Edge{{Target: "approved"}, {Target: "manager_review"}}},
+			{ID: "manager_review", Name: "Manager Review", Kind: runtime.NodeKindTask, Edges: []runtime.Edge{{Target: "approved"}}},
 			{ID: "approved", Name: "Approved", Kind: runtime.NodeKindTask},
 		},
 	}

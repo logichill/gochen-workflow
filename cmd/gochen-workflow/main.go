@@ -12,17 +12,19 @@ import (
 	workflowservice "gochen-workflow/service"
 
 	iammw "gochen-iam/middleware"
+	iamservice "gochen-iam/service"
+	"gochen-runtime/db/sql/stdsql"
+	"gochen-runtime/di"
+	dibasic "gochen-runtime/di/basic"
+	"gochen-runtime/host"
+	auth "gochen-runtime/host/authz"
+	hostconfig "gochen-runtime/host/config"
 	"gochen/clock"
 	"gochen/db"
-	"gochen/db/sql/stdsql"
-	"gochen/di"
-	dibasic "gochen/di/basic"
 	"gochen/errors"
-	"gochen/host"
-	hostconfig "gochen/host/config"
+	"gochen/gen"
 	"gochen/httpx"
-	"gochen/ident"
-	"gochen/logging"
+	"gochen/observe/logging"
 )
 
 const maxTCPPort = 65535
@@ -87,10 +89,14 @@ func run(ctx context.Context, logger logging.ILogger) error {
 	}
 
 	container := dibasic.New()
+	authRegistry := auth.NewRegistry()
+	if err := iamservice.InstallIAMPermissionCatalog(authRegistry); err != nil {
+		return err
+	}
 	if err := di.RegisterInstance[workflowservice.Store](container, store); err != nil {
 		return errors.Wrap(err, errors.Internal, "register workflow store")
 	}
-	if err := di.RegisterInstance[ident.IGenerator[string]](container, ident.NewUUIDGenerator()); err != nil {
+	if err := di.RegisterInstance[gen.IGenerator[string]](container, gen.NewUUIDGenerator()); err != nil {
 		return errors.Wrap(err, errors.Internal, "register workflow id generator")
 	}
 	if err := di.RegisterInstance[clock.IClock](container, clock.NewRealClock()); err != nil {
@@ -106,6 +112,7 @@ func run(ctx context.Context, logger logging.ILogger) error {
 		hostconfig.WithName("gochen-workflow"),
 		hostconfig.WithLogger(logger),
 		hostconfig.WithContainer(container),
+		hostconfig.WithCatalogRegistrar(auth.NewCatalogRegistrar(authRegistry)),
 		hostconfig.WithAddress(hostName),
 		hostconfig.WithPort(port),
 		hostconfig.WithBasePath("/api/v1"),

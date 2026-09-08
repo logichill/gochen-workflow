@@ -14,7 +14,7 @@ import (
 
 	workflowtypes "gochen-workflow/types"
 
-	"gochen/auth"
+	auth "gochen-runtime/host/authz"
 	"gochen/errors"
 	runtime "gochen/process/workflow"
 )
@@ -912,7 +912,7 @@ func TestMemoryStoreRuntimeSaveDefinitionSynthesizesDesign(t *testing.T) {
 		Name:        "Memory Runtime",
 		StartNodeID: "start",
 		Nodes: []runtime.Node{
-			{ID: "start", Name: "Start", Kind: runtime.NodeKindTask, Next: []string{"end"}},
+			{ID: "start", Name: "Start", Kind: runtime.NodeKindTask, Edges: []runtime.Edge{{Target: "end"}}},
 			{ID: "end", Name: "End", Kind: runtime.NodeKindTask},
 		},
 	}
@@ -948,11 +948,12 @@ func TestSQLiteStoreRuntimeSaveDefinitionPreservesExplicitNodeKinds(t *testing.T
 		Name:        "Choice Merge Runtime",
 		StartNodeID: "review",
 		Nodes: []runtime.Node{
-			{ID: "review", Name: "Review", Kind: runtime.NodeKindBranch, Next: []string{"approved", "manager_review"}},
-			{ID: "manager_review", Name: "Manager Review", Kind: runtime.NodeKindTask, Next: []string{"approved"}},
+			{ID: "review", Name: "Review", Kind: runtime.NodeKindBranch, Edges: []runtime.Edge{{Target: "approved"}, {Target: "manager_review"}}},
+			{ID: "manager_review", Name: "Manager Review", Kind: runtime.NodeKindTask, Edges: []runtime.Edge{{Target: "approved"}}},
 			{ID: "approved", Name: "Approved", Kind: runtime.NodeKindTask},
 		},
 	}
+
 	if err := store.SaveDefinition(ctx, def); err != nil {
 		t.Fatalf("save runtime definition: %v", err)
 	}
@@ -1005,7 +1006,7 @@ func TestSQLiteStoreRuntimeSaveDefinitionRefreshesDesignSnapshot(t *testing.T) {
 		CreatedAt:   createdAt,
 		UpdatedAt:   createdAt,
 		Nodes: []runtime.Node{
-			{ID: "start", Name: "Start", Kind: runtime.NodeKindTask, Next: []string{"old"}},
+			{ID: "start", Name: "Start", Kind: runtime.NodeKindTask, Edges: []runtime.Edge{{Target: "old"}}},
 			{ID: "old", Name: "Old", Kind: runtime.NodeKindTask},
 		},
 	}); err != nil {
@@ -1018,7 +1019,7 @@ func TestSQLiteStoreRuntimeSaveDefinitionRefreshesDesignSnapshot(t *testing.T) {
 		StartNodeID: "start",
 		UpdatedAt:   createdAt.Add(time.Hour),
 		Nodes: []runtime.Node{
-			{ID: "start", Name: "Start", Kind: runtime.NodeKindTask, Next: []string{"new"}},
+			{ID: "start", Name: "Start", Kind: runtime.NodeKindTask, Edges: []runtime.Edge{{Target: "new"}}},
 			{ID: "new", Name: "New", Kind: runtime.NodeKindTask},
 		},
 	}); err != nil {
@@ -1131,9 +1132,9 @@ func TestSQLiteStoreRuntimeSaveDefinitionGeneratesUniqueEdgeIDs(t *testing.T) {
 		Name:        "Runtime Edge IDs",
 		StartNodeID: "start",
 		Nodes: []runtime.Node{
-			{ID: "start", Name: "Start", Kind: runtime.NodeKindBranch, Next: []string{"a-b", "a"}},
-			{ID: "a-b", Name: "A B", Kind: runtime.NodeKindTask, Next: []string{"c"}},
-			{ID: "a", Name: "A", Kind: runtime.NodeKindTask, Next: []string{"b-c"}},
+			{ID: "start", Name: "Start", Kind: runtime.NodeKindBranch, Edges: []runtime.Edge{{Target: "a-b"}, {Target: "a"}}},
+			{ID: "a-b", Name: "A B", Kind: runtime.NodeKindTask, Edges: []runtime.Edge{{Target: "c"}}},
+			{ID: "a", Name: "A", Kind: runtime.NodeKindTask, Edges: []runtime.Edge{{Target: "b-c"}}},
 			{ID: "c", Name: "C", Kind: runtime.NodeKindTask},
 			{ID: "b-c", Name: "B C", Kind: runtime.NodeKindTask},
 		},
@@ -2377,4 +2378,398 @@ func (s *nonCloningDesignStore) GetDesign(ctx context.Context, id string) (*work
 		return nil, nil
 	}
 	return s.design, nil
+}
+
+func TestStore_MultiVersionDefinitionRetrievalAndInstanceRecovery(t *testing.T) {
+	testStores := map[string]func(t *testing.T) Store{
+		"memory": func(t *testing.T) Store {
+			return NewMemoryStore()
+		},
+		"sqlite": func(t *testing.T) Store {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "test_ver.db")
+			store, err := OpenSQLiteStore(ctx, dbPath)
+			if err != nil {
+				t.Fatalf("open sqlite store: %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			return store
+		},
+	}
+
+	for name, factory := range testStores {
+		t.Run(name, func(t *testing.T) {
+			store := factory(t)
+			ctx := context.Background()
+
+			// 1. 保存并发布 v1
+			v1Design := sampleDesign()
+			v1Design.ID = "multi-ver-flow"
+			v1Design.Version = 1
+			v1Design.Status = workflowtypes.StatusPublished
+			v1Runtime := runtimeDefinitionForTest(t, v1Design)
+			if err := store.SaveDesign(ctx, v1Design, v1Runtime); err != nil {
+				t.Fatalf("save v1 design: %v", err)
+			}
+
+			// 2. 保存并发布 v2（修改节点名称和结构）
+			v2Design := sampleDesign()
+			v2Design.ID = "multi-ver-flow"
+			v2Design.Version = 2
+			v2Design.Status = workflowtypes.StatusPublished
+			v2Design.Description = "V2 updated description"
+			v2Design.Nodes[0].Name = "V2 Start Node"
+			v2Runtime := runtimeDefinitionForTest(t, v2Design)
+			if err := store.SaveDesign(ctx, v2Design, v2Runtime); err != nil {
+				t.Fatalf("save v2 design: %v", err)
+			}
+
+			// 3. 验证通过版本号获取定义
+			defV1, err := store.GetDefinition(ctx, "multi-ver-flow", 1)
+			if err != nil {
+				t.Fatalf("get v1: %v", err)
+			}
+			if defV1 == nil || defV1.Version != 1 {
+				t.Fatalf("expected v1 definition, got %#v", defV1)
+			}
+			if defV1.Nodes[0].Name != "Start" {
+				t.Fatalf("expected v1 start node name 'Start', got %q", defV1.Nodes[0].Name)
+			}
+
+			defV2, err := store.GetDefinition(ctx, "multi-ver-flow", 2)
+			if err != nil {
+				t.Fatalf("get v2: %v", err)
+			}
+			if defV2 == nil || defV2.Version != 2 {
+				t.Fatalf("expected v2 definition, got %#v", defV2)
+			}
+			if defV2.Nodes[0].Name != "V2 Start Node" {
+				t.Fatalf("expected v2 start node name 'V2 Start Node', got %q", defV2.Nodes[0].Name)
+			}
+
+			// version = 0 应返回最新版本 v2
+			defLatest, err := store.GetDefinition(ctx, "multi-ver-flow", 0)
+			if err != nil {
+				t.Fatalf("get latest: %v", err)
+			}
+			if defLatest == nil || defLatest.Version != 2 {
+				t.Fatalf("expected latest version 2, got %#v", defLatest)
+			}
+
+			// 4. 保存 v3 版本并测试删除最新版本
+			v3Design := cloneDesign(v2Design)
+			v3Design.Version = 3
+			v3Design.Name = "V3 Renamed Flow"
+			v3Design.Status = workflowtypes.StatusArchived
+			v3Design.Description = "V3 updated description"
+			v3Design.Nodes[0].Name = "V3 Start Node"
+			v3Runtime := runtimeDefinitionForTest(t, v3Design)
+			if err := store.SaveDesign(ctx, v3Design, v3Runtime); err != nil {
+				t.Fatalf("save v3 design: %v", err)
+			}
+
+			// 验证最新版为 v3
+			defV3Latest, err := store.GetDefinition(ctx, "multi-ver-flow", 0)
+			if err != nil || defV3Latest == nil || defV3Latest.Version != 3 {
+				t.Fatalf("expected latest version 3, got %#v (err: %v)", defV3Latest, err)
+			}
+
+			// 删除最新版本 v3 -> version 0 应自动回退到 v2
+			if err := store.DeleteDefinition(ctx, "multi-ver-flow", 3); err != nil {
+				t.Fatalf("delete latest version v3: %v", err)
+			}
+			defAfterV3Delete, err := store.GetDefinition(ctx, "multi-ver-flow", 0)
+			if err != nil || defAfterV3Delete == nil || defAfterV3Delete.Version != 2 {
+				t.Fatalf("expected latest version to fall back to 2, got %#v (err: %v)", defAfterV3Delete, err)
+			}
+
+			// 设计态元数据同样要回退到 v2，不能残留被删版本的 name/status。
+			designAfterV3Delete, err := store.GetDesign(ctx, "multi-ver-flow")
+			if err != nil {
+				t.Fatalf("get design after v3 delete: %v", err)
+			}
+			if designAfterV3Delete == nil || designAfterV3Delete.Version != 2 {
+				t.Fatalf("expected design to fall back to v2, got %#v", designAfterV3Delete)
+			}
+			if designAfterV3Delete.Name != v2Design.Name || designAfterV3Delete.Status != v2Design.Status {
+				t.Fatalf("expected v2 design metadata (name=%q status=%q), got name=%q status=%q",
+					v2Design.Name, v2Design.Status, designAfterV3Delete.Name, designAfterV3Delete.Status)
+			}
+			if designAfterV3Delete.Description != v2Design.Description {
+				t.Fatalf("expected v2 design description %q, got %q", v2Design.Description, designAfterV3Delete.Description)
+			}
+			// 列表筛选与统计走 name/status 列而非 graph_json，列残留会让筛选结果与设计态不一致。
+			if queryStore, ok := store.(definitionQueryStore); ok {
+				listed, err := queryStore.queryDesigns(ctx, definitionListQuery{page: 1, size: 10})
+				if err != nil {
+					t.Fatalf("query designs after v3 delete: %v", err)
+				}
+				if listed.StatusCounts.Published != 1 || listed.StatusCounts.Archived != 0 {
+					t.Fatalf("expected status counts to follow rolled-back v2 (published=1 archived=0), got %#v", listed.StatusCounts)
+				}
+			}
+
+			// 5. 删除历史版本 v1
+			if err := store.DeleteDefinition(ctx, "multi-ver-flow", 1); err != nil {
+				t.Fatalf("delete v1: %v", err)
+			}
+			defV1After, err := store.GetDefinition(ctx, "multi-ver-flow", 1)
+			if err != nil {
+				t.Fatalf("get v1 after delete: %v", err)
+			}
+			if defV1After != nil {
+				t.Fatalf("expected v1 to be deleted, got %#v", defV1After)
+			}
+
+			// v2 依然作为最新版完好保留
+			defV2After, err := store.GetDefinition(ctx, "multi-ver-flow", 0)
+			if err != nil {
+				t.Fatalf("get v2 after v1 delete: %v", err)
+			}
+			if defV2After == nil || defV2After.Version != 2 {
+				t.Fatalf("expected v2 to remain, got %#v", defV2After)
+			}
+
+			// 6. 删除所有版本 (version = 0)
+			if err := store.DeleteDefinition(ctx, "multi-ver-flow", 0); err != nil {
+				t.Fatalf("delete all: %v", err)
+			}
+			defAllAfter, err := store.GetDefinition(ctx, "multi-ver-flow", 0)
+			if err != nil {
+				t.Fatalf("get latest after full delete: %v", err)
+			}
+			if defAllAfter != nil {
+				t.Fatalf("expected all definitions deleted, got %#v", defAllAfter)
+			}
+		})
+	}
+}
+
+func TestService_V1InstanceExecutesV1DefinitionAfterV2Published(t *testing.T) {
+	testStores := map[string]func(t *testing.T) Store{
+		"memory": func(t *testing.T) Store {
+			return NewMemoryStore()
+		},
+		"sqlite": func(t *testing.T) Store {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "test_service_ver.db")
+			store, err := OpenSQLiteStore(ctx, dbPath)
+			if err != nil {
+				t.Fatalf("open sqlite store: %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			return store
+		},
+	}
+
+	for name, factory := range testStores {
+		t.Run(name, func(t *testing.T) {
+			store := factory(t)
+			service := newTestService(store)
+			ctx := context.Background()
+
+			// 1. 创建并发布 v1 定义: start -> review -> approve
+			v1Design := &workflowtypes.DesignerDefinition{
+				ID:          "exec-version-flow",
+				Name:        "Version Flow",
+				Version:     1,
+				Status:      workflowtypes.StatusPublished,
+				StartNodeID: "start",
+				Nodes: []workflowtypes.DesignerNode{
+					{ID: "start", Name: "Start", Type: workflowtypes.NodeKindTask, Next: []string{"review"}},
+					{ID: "review", Name: "Review", Type: workflowtypes.NodeKindTask, Next: []string{"approve"}},
+					{ID: "approve", Name: "Approve", Type: workflowtypes.NodeKindTask},
+				},
+				Edges: []workflowtypes.DesignerEdge{
+					{ID: "e1", Source: "start", Target: "review"},
+					{ID: "e2", Source: "review", Target: "approve"},
+				},
+			}
+			v1Runtime := runtimeDefinitionForTest(t, v1Design)
+			if err := store.SaveDesign(ctx, v1Design, v1Runtime); err != nil {
+				t.Fatalf("save v1: %v", err)
+			}
+
+			// 2. 创建并启动实例 1（基于 v1）
+			inst1, err := service.CreateInstance(ctx, "inst-v1", v1Design.ID, nil)
+			if err != nil {
+				t.Fatalf("create inst1: %v", err)
+			}
+			st1, err := service.StartInstance(ctx, inst1.ID)
+			if err != nil {
+				t.Fatalf("start inst1: %v", err)
+			}
+			if len(st1.ActiveNodeIDs) != 1 || st1.ActiveNodeIDs[0] != "start" {
+				t.Fatalf("inst1 expected active node 'start', got %#v", st1.ActiveNodeIDs)
+			}
+			st1, err = service.AdvanceNode(ctx, inst1.ID, "start")
+			if err != nil {
+				t.Fatalf("advance inst1 to review: %v", err)
+			}
+			if len(st1.ActiveNodeIDs) != 1 || st1.ActiveNodeIDs[0] != "review" {
+				t.Fatalf("inst1 expected active node 'review', got %#v", st1.ActiveNodeIDs)
+			}
+
+			// 3. 发布 v2 定义: start -> manager_review -> approve
+			v2Design := &workflowtypes.DesignerDefinition{
+				ID:          "exec-version-flow",
+				Name:        "Version Flow",
+				Version:     2,
+				Status:      workflowtypes.StatusPublished,
+				StartNodeID: "start",
+				Nodes: []workflowtypes.DesignerNode{
+					{ID: "start", Name: "Start", Type: workflowtypes.NodeKindTask, Next: []string{"manager_review"}},
+					{ID: "manager_review", Name: "Manager Review", Type: workflowtypes.NodeKindTask, Next: []string{"approve"}},
+					{ID: "approve", Name: "Approve", Type: workflowtypes.NodeKindTask},
+				},
+				Edges: []workflowtypes.DesignerEdge{
+					{ID: "e1", Source: "start", Target: "manager_review"},
+					{ID: "e2", Source: "manager_review", Target: "approve"},
+				},
+			}
+			v2Runtime := runtimeDefinitionForTest(t, v2Design)
+			if err := store.SaveDesign(ctx, v2Design, v2Runtime); err != nil {
+				t.Fatalf("save v2: %v", err)
+			}
+
+			// 4. 推进实例 1（应该按 v1 的 review 节点流转到 approve）
+			st1Advanced, err := service.AdvanceNode(ctx, inst1.ID, "review")
+			if err != nil {
+				t.Fatalf("advance review on v1 instance: %v", err)
+			}
+			if len(st1Advanced.ActiveNodeIDs) != 1 || st1Advanced.ActiveNodeIDs[0] != "approve" {
+				t.Fatalf("inst1 expected advanced to 'approve', got %#v", st1Advanced.ActiveNodeIDs)
+			}
+
+			// 5. 新建实例 2（应走 v2，进入 manager_review）
+			inst2, err := service.CreateInstance(ctx, "inst-v2", v2Design.ID, nil)
+			if err != nil {
+				t.Fatalf("create inst2: %v", err)
+			}
+			st2, err := service.StartInstance(ctx, inst2.ID)
+			if err != nil {
+				t.Fatalf("start inst2: %v", err)
+			}
+			st2, err = service.AdvanceNode(ctx, inst2.ID, "start")
+			if err != nil {
+				t.Fatalf("advance inst2 start: %v", err)
+			}
+			if len(st2.ActiveNodeIDs) != 1 || st2.ActiveNodeIDs[0] != "manager_review" {
+				t.Fatalf("inst2 expected active node 'manager_review', got %#v", st2.ActiveNodeIDs)
+			}
+		})
+	}
+}
+
+func TestSQLiteStoreMigratesLegacyNextToEdges(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy-edges.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, createWorkflowDefinitionsTable("workflow_definitions")); err != nil {
+		t.Fatalf("create legacy definitions table: %v", err)
+	}
+	legacyDefinition := `{"id":"legacy-def","name":"Legacy","start_node_id":"start","nodes":[
+		{"id":"start","name":"Start","kind":"task","next":["end"]},
+		{"id":"end","name":"End","kind":"end","next":[]}
+	]}`
+	if _, err := db.ExecContext(ctx, `INSERT INTO workflow_definitions
+		(id, name, version, status, graph_json, runtime_definition_json, created_at, updated_at)
+		VALUES ('legacy-def', 'Legacy', 1, 'published', '{}', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+		legacyDefinition); err != nil {
+		t.Fatalf("insert legacy definition: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy sqlite: %v", err)
+	}
+
+	store, err := OpenSQLiteStore(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open migrated sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	def, err := store.GetDefinition(ctx, "legacy-def", 1)
+	if err != nil || def == nil {
+		t.Fatalf("get migrated legacy definition: def=%v err=%v", def, err)
+	}
+	if len(def.Nodes) != 2 {
+		t.Fatalf("migrated definition nodes = %#v", def.Nodes)
+	}
+	for _, node := range def.Nodes {
+		switch node.ID {
+		case "start":
+			if len(node.Edges) != 1 || node.Edges[0].Target != "end" {
+				t.Fatalf("start node edges = %#v, want single edge to end", node.Edges)
+			}
+		case "end":
+			if len(node.Edges) != 0 {
+				t.Fatalf("end node edges = %#v, want none", node.Edges)
+			}
+		default:
+			t.Fatalf("unexpected node %q", node.ID)
+		}
+	}
+
+	var mainJSON, versionJSON string
+	if err := store.db.QueryRowContext(ctx, `SELECT runtime_definition_json FROM workflow_definitions WHERE id = 'legacy-def'`).Scan(&mainJSON); err != nil {
+		t.Fatalf("read migrated main table: %v", err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT runtime_definition_json FROM workflow_definition_versions WHERE id = 'legacy-def' AND version = 1`).Scan(&versionJSON); err != nil {
+		t.Fatalf("read migrated versions table: %v", err)
+	}
+	if strings.Contains(mainJSON, `"next"`) || strings.Contains(versionJSON, `"next"`) {
+		t.Fatalf("legacy next field survived migration: main=%s version=%s", mainJSON, versionJSON)
+	}
+}
+
+func TestSQLiteStoreMigrationPinsLegacyInstancesToDefinitionVersion(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy-instance-version.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	for _, stmt := range []string{
+		createWorkflowDefinitionsTable("workflow_definitions"),
+		createWorkflowInstancesTable("workflow_instances"),
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("create legacy table: %v", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO workflow_definitions
+		(id, name, version, status, graph_json, runtime_definition_json, created_at, updated_at)
+		VALUES ('pin-def', 'Pin', 3, 'published', '{}', '{"id":"pin-def","name":"Pin","start_node_id":"start","nodes":[{"id":"start","name":"Start","kind":"task"}]}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("insert legacy definition: %v", err)
+	}
+	// 老实例的 state_json 没有 definition_version；另一条已钉到 v2 的实例不能被改写。
+	if _, err := db.ExecContext(ctx, `INSERT INTO workflow_instances
+		(id, definition_id, status, version, state_json, data_json, created_at, updated_at)
+		VALUES
+		('inst-legacy', 'pin-def', 'running', 1, '{"id":"inst-legacy","definition_id":"pin-def","status":"running"}', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+		('inst-pinned', 'pin-def', 'running', 1, '{"id":"inst-pinned","definition_id":"pin-def","definition_version":2,"status":"running"}', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("insert legacy instances: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy sqlite: %v", err)
+	}
+
+	store, err := OpenSQLiteStore(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open migrated sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	for id, want := range map[string]uint32{"inst-legacy": 3, "inst-pinned": 2} {
+		st, err := store.Get(ctx, runtime.ID(id))
+		if err != nil || st == nil {
+			t.Fatalf("get %s: st=%v err=%v", id, st, err)
+		}
+		if st.DefinitionVersion != want {
+			t.Fatalf("%s definition_version = %d, want %d", id, st.DefinitionVersion, want)
+		}
+	}
 }

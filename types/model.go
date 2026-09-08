@@ -345,12 +345,16 @@ func InstanceStateFromRuntime(st *runtime.State) *InstanceState {
 	if st == nil {
 		return nil
 	}
+	var currentNodeID string
+	if len(st.ActiveNodeIDs) > 0 {
+		currentNodeID = st.ActiveNodeIDs[0]
+	}
 	out := &InstanceState{
 		ID:               string(st.ID),
 		DefinitionID:     st.DefinitionID,
 		Version:          st.Version,
 		Status:           st.Status,
-		CurrentNodeID:    st.CurrentNodeID,
+		CurrentNodeID:    currentNodeID,
 		ActiveNodeIDs:    append([]string(nil), st.ActiveNodeIDs...),
 		CompletedNodeIDs: append([]string(nil), st.CompletedNodeIDs...),
 		Data:             PublicInstanceData(st.Data),
@@ -554,16 +558,21 @@ func (d *DesignerDefinition) ToRuntimeDefinition() (*runtime.Definition, error) 
 		if kind == "" {
 			kind = inferNodeKind(len(dedupeStrings(nextByNode[node.ID])), incomingByNode[node.ID])
 		}
+		var edges []runtime.Edge
+		for _, target := range dedupeStrings(nextByNode[node.ID]) {
+			edges = append(edges, runtime.Edge{Target: target})
+		}
 		nodes = append(nodes, runtime.Node{
 			ID:       node.ID,
 			Name:     node.Name,
 			Kind:     runtime.NodeKind(kind),
-			Next:     dedupeStrings(nextByNode[node.ID]),
+			Edges:    edges,
 			RejectTo: dedupeStrings(node.RejectTo),
 		})
 	}
 	runtimeDef := &runtime.Definition{
 		ID:          d.ID,
+		Version:     uint32(d.Version),
 		Name:        d.Name,
 		Nodes:       nodes,
 		StartNodeID: d.StartNodeID,
@@ -589,7 +598,7 @@ func RuntimeDefinitionFromRuntime(def *runtime.Definition, design *DesignerDefin
 	}
 	nextByNode := make(map[string][]string, len(def.Nodes))
 	for _, node := range def.Nodes {
-		nextByNode[node.ID] = node.Next
+		nextByNode[node.ID] = node.NextNodes()
 	}
 	incomingByNode := incomingCounts(nextByNode)
 	out := &RuntimeDefinition{
@@ -603,14 +612,15 @@ func RuntimeDefinitionFromRuntime(def *runtime.Definition, design *DesignerDefin
 		if designKind := kindByNode[node.ID]; designKind != "" {
 			kind = designKind
 		}
+		nextNodes := node.NextNodes()
 		if kind == "" {
-			kind = inferNodeKind(len(node.Next), incomingByNode[node.ID])
+			kind = inferNodeKind(len(nextNodes), incomingByNode[node.ID])
 		}
 		out.Nodes = append(out.Nodes, RuntimeNode{
 			ID:       node.ID,
 			Name:     node.Name,
 			Type:     kind,
-			Next:     dedupeStrings(node.Next),
+			Next:     dedupeStrings(nextNodes),
 			RejectTo: dedupeStrings(node.RejectTo),
 		})
 	}

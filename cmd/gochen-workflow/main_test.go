@@ -9,10 +9,10 @@ import (
 
 	iamauth "gochen-iam/auth"
 	iammw "gochen-iam/middleware"
-	auth "gochen/auth"
+	auth "gochen-runtime/host/authz"
+	"gochen-runtime/http/nethttp"
 	"gochen/httpx"
-	"gochen/httpx/nethttp"
-	"gochen/logging"
+	"gochen/observe/logging"
 )
 
 func TestListenAddressParsesSupportedForms(t *testing.T) {
@@ -82,8 +82,8 @@ func TestInstallStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 	t.Cleanup(func() { iammw.InstallAuthContextResolver(previous) })
 
 	installStandaloneAuthContextResolver()
-	iammw.RegisterRequiredPermissions("api:workflow:read")
-	token, err := iammw.GenerateToken(7, 42, "binding-v1", []string{"api:workflow:read"}, "test-secret")
+	iammw.RegisterRequiredPermissions(workflowpermissions.WorkflowReadCode)
+	token, err := iammw.GenerateToken(7, 42, "binding-v1", []string{workflowpermissions.WorkflowReadCode}, "test-secret")
 	if err != nil {
 		t.Fatalf("GenerateToken returned error: %v", err)
 	}
