@@ -11,14 +11,15 @@ import (
 	workflow "gochen-workflow"
 	workflowservice "gochen-workflow/service"
 
+	iamconfig "gochen-iam/config"
 	iammw "gochen-iam/middleware"
 	iamservice "gochen-iam/service"
 	"gochen-runtime/db/sql/stdsql"
 	"gochen-runtime/di"
 	dibasic "gochen-runtime/di/basic"
-	"gochen-runtime/host"
 	auth "gochen-runtime/host/authz"
 	hostconfig "gochen-runtime/host/config"
+	"gochen-runtime/quick"
 	"gochen/clock"
 	"gochen/db"
 	"gochen/errors"
@@ -38,7 +39,6 @@ func main() {
 }
 
 func run(ctx context.Context, logger logging.ILogger) error {
-	installStandaloneAuthContextResolver()
 
 	startupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -64,11 +64,12 @@ func run(ctx context.Context, logger logging.ILogger) error {
 	if err != nil {
 		return errors.Wrap(err, errors.Internal, "create workflow token revocation store")
 	}
+	authConfig, err := newStandaloneAuthConfig(revokedTokenStore)
+	if err != nil {
+		return errors.Wrap(err, errors.InvalidInput, "workflow auth config validation failed")
+	}
 	if err := iammw.InstallDefaultRevokedTokenStore(revokedTokenStore); err != nil {
 		return errors.Wrap(err, errors.Internal, "install workflow token revocation store")
-	}
-	if err := iammw.ValidateAuthConfig(nil); err != nil {
-		return errors.Wrap(err, errors.Internal, "workflow auth config validation failed")
 	}
 	if err := iammw.EnsureDatabaseRevokedTokenSchema(startupCtx, database); err != nil {
 		return errors.Wrap(err, errors.Database, "initialize workflow token revocation schema")
@@ -108,7 +109,7 @@ func run(ctx context.Context, logger logging.ILogger) error {
 		return err
 	}
 
-	return host.Run(ctx,
+	server := quick.New(
 		hostconfig.WithName("gochen-workflow"),
 		hostconfig.WithLogger(logger),
 		hostconfig.WithContainer(container),
@@ -116,11 +117,11 @@ func run(ctx context.Context, logger logging.ILogger) error {
 		hostconfig.WithAddress(hostName),
 		hostconfig.WithPort(port),
 		hostconfig.WithBasePath("/api/v1"),
-		hostconfig.WithRouteMiddlewares(standaloneRouteMiddlewares(logger)...),
-		hostconfig.WithModuleHTTP("workflow", hostconfig.ModuleHTTPConfig{Prefix: "/workflows"}),
-		hostconfig.WithModules(workflow.NewModule),
 		hostconfig.WithFailFastOnRouteConflicts(true),
 	)
+	server.Use(standaloneRouteMiddlewares(logger, authConfig)...)
+	server.Modules(workflow.NewModule)
+	return server.Run(ctx)
 }
 
 // sqliteStoreOptionsFromEnv 将历史无 scope 数据显式绑定到 standalone 服务配置的 scope。
@@ -181,18 +182,30 @@ func parseWorkflowPort(portText string, rawAddr string) (int, error) {
 	return port, nil
 }
 
-func standaloneRouteMiddlewares(logger logging.ILogger) []httpx.Middleware {
+func newStandaloneAuthConfig(revokedTokenStore iammw.RevokedTokenStore) (*iammw.AuthConfig, error) {
+	runtimeConfig := iamconfig.ApplyEnvOverrides(iamconfig.DefaultRuntimeConfig())
+	environment := strings.TrimSpace(os.Getenv("APP_ENV"))
+	if err := iamconfig.ValidateRuntimeConfig(runtimeConfig, environment, true); err != nil {
+		return nil, err
+	}
+	authConfig := iamconfig.NewAuthConfig(runtimeConfig, environment)
+	authConfig.Enabled = true
+	authConfig.ContextResolver = standaloneAuthContextResolver{}
+	authConfig.RevokedTokenStore = revokedTokenStore
+	if err := iammw.ValidateAuthConfig(authConfig); err != nil {
+		return nil, err
+	}
+	return authConfig, nil
+}
+
+func standaloneRouteMiddlewares(logger logging.ILogger, authConfig *iammw.AuthConfig) []httpx.Middleware {
 	return []httpx.Middleware{
 		iammw.AuditMiddleware(logger, nil),
-		iammw.AuthMiddleware(nil),
+		iammw.AuthMiddleware(authConfig),
 	}
 }
 
 type standaloneAuthContextResolver struct{}
-
-func installStandaloneAuthContextResolver() {
-	iammw.InstallAuthContextResolver(standaloneAuthContextResolver{})
-}
 
 func (standaloneAuthContextResolver) ResolveAuthContext(_ context.Context, claims *iammw.JWTClaims) (*iammw.ResolvedAuthContext, error) {
 	if claims == nil || claims.ActiveScopeID <= 0 {

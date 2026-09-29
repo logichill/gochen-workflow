@@ -8,6 +8,7 @@ import (
 	workflowpermissions "gochen-workflow/permissions"
 
 	iamauth "gochen-iam/auth"
+	iamconfig "gochen-iam/config"
 	iammw "gochen-iam/middleware"
 	auth "gochen-runtime/host/authz"
 	"gochen-runtime/http/nethttp"
@@ -76,19 +77,15 @@ func TestSQLiteStoreOptionsFromEnvRejectsInvalidScopeKind(t *testing.T) {
 	}
 }
 
-func TestInstallStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
+func TestStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 	t.Setenv("APP_ENV", "test")
-	previous := iammw.ResolveInstalledAuthContextResolver()
-	t.Cleanup(func() { iammw.InstallAuthContextResolver(previous) })
-
-	installStandaloneAuthContextResolver()
 	iammw.RegisterRequiredPermissions(workflowpermissions.WorkflowReadCode)
 	token, err := iammw.GenerateToken(7, 42, "binding-v1", []string{workflowpermissions.WorkflowReadCode}, "test-secret")
 	if err != nil {
 		t.Fatalf("GenerateToken returned error: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/workflows/definitions", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/workflow/definitions", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	ctx, err := nethttp.NewBaseContext(httptest.NewRecorder(), req)
 	if err != nil {
@@ -96,9 +93,11 @@ func TestInstallStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 	}
 
 	mw := iammw.AuthMiddleware(&iammw.AuthConfig{
-		SecretKey:   "test-secret",
-		TokenHeader: "Authorization",
-		TokenPrefix: "Bearer ",
+		Environment:     "test",
+		ContextResolver: standaloneAuthContextResolver{},
+		SecretKey:       "test-secret",
+		TokenHeader:     "Authorization",
+		TokenPrefix:     "Bearer ",
 	})
 	called := false
 	if err := mw(ctx, func() error { called = true; return nil }); err != nil {
@@ -121,7 +120,8 @@ func TestInstallStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 
 func TestWorkflowStandaloneAuthConfigRequiresSecret(t *testing.T) {
 	t.Setenv("AUTH_SECRET", "")
-	if err := iammw.ValidateAuthConfig(nil); err == nil {
+	config := iamconfig.NewAuthConfig(iamconfig.ApplyEnvOverrides(iamconfig.DefaultRuntimeConfig()), "test")
+	if err := iammw.ValidateAuthConfig(config); err == nil {
 		t.Fatal("expected missing AUTH_SECRET to fail")
 	}
 }
@@ -129,11 +129,9 @@ func TestWorkflowStandaloneAuthConfigRequiresSecret(t *testing.T) {
 func TestStandaloneRouteMiddlewaresAuthenticateBeforePermissions(t *testing.T) {
 	t.Setenv("APP_ENV", "test")
 	t.Setenv("AUTH_SECRET", "workflow-test-secret")
-	previous := iammw.ResolveInstalledAuthContextResolver()
-	t.Cleanup(func() { iammw.InstallAuthContextResolver(previous) })
-
-	installStandaloneAuthContextResolver()
-	middlewares := standaloneRouteMiddlewares(logging.NewNoopLogger())
+	config := iamconfig.NewAuthConfig(iamconfig.ApplyEnvOverrides(iamconfig.DefaultRuntimeConfig()), "test")
+	config.ContextResolver = standaloneAuthContextResolver{}
+	middlewares := standaloneRouteMiddlewares(logging.NewNoopLogger(), config)
 	if len(middlewares) == 0 {
 		t.Fatal("expected standalone route middlewares")
 	}
@@ -150,7 +148,7 @@ func TestStandaloneRouteMiddlewaresAuthenticateBeforePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateToken returned error: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/workflows/definitions", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/workflow/definitions", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	ctx, err := nethttp.NewBaseContext(rec, req)

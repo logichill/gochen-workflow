@@ -53,43 +53,46 @@ go run ./cmd/gochen-workflow
 
 ```go
 import workflow "gochen-workflow"
-import hostconfig "gochen/host/config"
+import "gochen-runtime/quick"
 
-hostconfig.WithModules(workflow.NewModule)
-hostconfig.WithModuleHTTP("workflow", hostconfig.ModuleHTTPConfig{Prefix: "/workflows"})
+app := quick.New(hostOptions...)
+app.Group("").Use(authMiddleware).Modules(workflow.NewModule)
+err := app.Run(ctx)
 ```
+
+Host 未配置模块前缀时，会根据模块 ID 自动挂载到 `/workflow`。
 
 模块依赖 `service.Store`、`ident.IGenerator[string]` 与 `clock.IClock`，由宿主通过 GoChen DI 注入。当前仓库的 [`go.mod`](/home/alex/data/priv/project/gochen-workflow/go.mod) 通过 `replace` 指向相邻工作区 `../gochen` 与 `../gochen-iam`；若脱离该 mono-workspace 单独使用，需要改成可解析的模块来源。
 
 ## API
 
-- `GET /api/v1/workflows/definitions`
-- `POST /api/v1/workflows/definitions`
-- `GET /api/v1/workflows/definitions/{id}`
-- `PUT /api/v1/workflows/definitions/{id}`
-- `DELETE /api/v1/workflows/definitions/{id}`
-- `POST /api/v1/workflows/definitions/{id}/publish`
-- `POST /api/v1/workflows/definitions/{id}/archive`
-- `POST /api/v1/workflows/instances`
-- `GET /api/v1/workflows/instances`
-- `GET /api/v1/workflows/instances/{id}`
-- `POST /api/v1/workflows/instances/{id}/start`
-- `POST /api/v1/workflows/instances/{id}/nodes/{node_id}/advance`
-- `POST /api/v1/workflows/instances/{id}/nodes/{node_id}/complete`
-- `POST /api/v1/workflows/instances/{id}/nodes/{node_id}/reject`
-- `POST /api/v1/workflows/instances/{id}/nodes/{node_id}/claim`
-- `POST /api/v1/workflows/instances/{id}/nodes/{node_id}/unclaim`
-- `POST /api/v1/workflows/instances/{id}/nodes/{node_id}/transfer`
-- `POST /api/v1/workflows/instances/{id}/nodes/{node_id}/delegate`
-- `POST /api/v1/workflows/instances/{id}/nodes/{node_id}/remind`
-- `POST /api/v1/workflows/instances/{id}/cc`
-- `POST /api/v1/workflows/instances/{id}/withdraw`
-- `GET /api/v1/workflows/todos`
-- `GET /api/v1/workflows/done`
-- `GET /api/v1/workflows/started`
-- `GET /api/v1/workflows/my/todos`
-- `GET /api/v1/workflows/my/done`
-- `GET /api/v1/workflows/my/started`
+- `GET /api/v1/workflow/definitions`
+- `POST /api/v1/workflow/definitions`
+- `GET /api/v1/workflow/definitions/{id}`
+- `PUT /api/v1/workflow/definitions/{id}`
+- `DELETE /api/v1/workflow/definitions/{id}`
+- `POST /api/v1/workflow/definitions/{id}/publish`
+- `POST /api/v1/workflow/definitions/{id}/archive`
+- `POST /api/v1/workflow/instances`
+- `GET /api/v1/workflow/instances`
+- `GET /api/v1/workflow/instances/{id}`
+- `POST /api/v1/workflow/instances/{id}/start`
+- `POST /api/v1/workflow/instances/{id}/nodes/{node_id}/advance`
+- `POST /api/v1/workflow/instances/{id}/nodes/{node_id}/complete`
+- `POST /api/v1/workflow/instances/{id}/nodes/{node_id}/reject`
+- `POST /api/v1/workflow/instances/{id}/nodes/{node_id}/claim`
+- `POST /api/v1/workflow/instances/{id}/nodes/{node_id}/unclaim`
+- `POST /api/v1/workflow/instances/{id}/nodes/{node_id}/transfer`
+- `POST /api/v1/workflow/instances/{id}/nodes/{node_id}/delegate`
+- `POST /api/v1/workflow/instances/{id}/nodes/{node_id}/remind`
+- `POST /api/v1/workflow/instances/{id}/cc`
+- `POST /api/v1/workflow/instances/{id}/withdraw`
+- `GET /api/v1/workflow/todos`
+- `GET /api/v1/workflow/done`
+- `GET /api/v1/workflow/started`
+- `GET /api/v1/workflow/my/todos`
+- `GET /api/v1/workflow/my/done`
+- `GET /api/v1/workflow/my/started`
 
 响应统一使用 GoChen `httpx.ResponseMessage`，业务数据位于 `data`；实例响应使用 snake_case DTO，不直接暴露核心 runtime 结构体字段。
 列表分页统一使用 `page/size`，不支持 `page_size`。`/todos`、`/done`、`/started` 和 `/instances` 是当前 scope 监控视角；`/my/*` 按当前 `Principal.SubjectID` 过滤个人发起、待办和已办。

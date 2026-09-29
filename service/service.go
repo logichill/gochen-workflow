@@ -3,7 +3,6 @@ package workflowservice
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	workflowtypes "gochen-workflow/types"
 
 	auth "gochen-runtime/host/authz"
+	appquery "gochen/app/query"
 	"gochen/clock"
 	"gochen/errors"
 	"gochen/gen"
@@ -97,7 +97,7 @@ func (s *Service) BuildDefinitionListResponseWithQuery(ctx context.Context, quer
 	normalizedQuery := definitionListQuery{
 		page:    page,
 		size:    size,
-		offset:  (page - 1) * size,
+		offset:  (&appquery.PaginationOptions{Page: page, Size: size}).Offset(),
 		keyword: strings.ToLower(strings.TrimSpace(query.Keyword)),
 		status:  query.Status,
 	}
@@ -137,6 +137,10 @@ func (s *Service) BuildDefinitionListResponseWithQuery(ctx context.Context, quer
 }
 
 func normalizeDefinitionPage(page, size int) (int, int, error) {
+	return normalizeWorkflowPage(page, size, "workflow definition")
+}
+
+func normalizeWorkflowPage(page, size int, kind string) (int, int, error) {
 	if page == 0 {
 		page = 1
 	}
@@ -144,15 +148,16 @@ func normalizeDefinitionPage(page, size int) (int, int, error) {
 		size = 20
 	}
 	if page < 1 {
-		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow definition page must be greater than 0")
+		return 0, 0, errors.NewCode(errors.InvalidInput, kind+" page must be greater than 0")
 	}
 	if size < 1 || size > 100 {
-		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow definition size must be between 1 and 100")
+		return 0, 0, errors.NewCode(errors.InvalidInput, kind+" size must be between 1 and 100")
 	}
-	if page > 1 && page-1 > math.MaxInt/size {
-		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow definition pagination offset is too large")
+	options := &appquery.PaginationOptions{Page: page, Size: size}
+	if err := options.Validate(100); err != nil {
+		return 0, 0, err
 	}
-	return page, size, nil
+	return options.Page, options.Size, nil
 }
 
 func filterDefinitionsByKeyword(items []*workflowtypes.DesignerDefinition, rawKeyword string) []*workflowtypes.DesignerDefinition {
@@ -1762,7 +1767,7 @@ func containsAnyString(values []string, targets []string) bool {
 
 func paginateInstances(items []workflowtypes.InstanceSummary, page int, size int) *workflowtypes.InstancePage {
 	total := len(items)
-	start := (page - 1) * size
+	start := (&appquery.PaginationOptions{Page: page, Size: size}).Offset()
 	if start >= total {
 		return &workflowtypes.InstancePage{Items: []workflowtypes.InstanceSummary{}, Total: total, Page: page, Size: size}
 	}
@@ -1779,30 +1784,12 @@ func paginateInstances(items []workflowtypes.InstanceSummary, page int, size int
 }
 
 func normalizeWorkItemPage(page int, size int) (int, int, error) {
-	if page == 0 {
-		page = 1
-	}
-	if size == 0 {
-		size = 20
-	}
-	if page < 0 {
-		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow work item page must be greater than 0")
-	}
-	if size < 0 {
-		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow work item size must be greater than 0")
-	}
-	if size > 100 {
-		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow work item size must not exceed 100")
-	}
-	if page > 1 && page-1 > math.MaxInt/size {
-		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow pagination offset is too large")
-	}
-	return page, size, nil
+	return normalizeWorkflowPage(page, size, "workflow work item")
 }
 
 func paginateWorkItems(items []workflowtypes.WorkItem, page int, size int) *workflowtypes.WorkItemPage {
 	total := len(items)
-	start := (page - 1) * size
+	start := (&appquery.PaginationOptions{Page: page, Size: size}).Offset()
 	if start >= total {
 		return &workflowtypes.WorkItemPage{Items: []workflowtypes.WorkItem{}, Total: total, Page: page, Size: size}
 	}

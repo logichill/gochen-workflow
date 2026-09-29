@@ -9,10 +9,12 @@ import (
 
 	iamauth "gochen-iam/auth"
 	iammw "gochen-iam/middleware"
+	"gochen-runtime/api/rest"
 	auth "gochen-runtime/host/authz"
 	workflowpermissions "gochen-workflow/permissions"
 	workflowservice "gochen-workflow/service"
 	workflowtypes "gochen-workflow/types"
+	"gochen/app/query"
 	"gochen/errors"
 	"gochen/httpx"
 	runtime "gochen/process/workflow"
@@ -22,6 +24,8 @@ import (
 type Registrar struct {
 	service *workflowservice.Service
 }
+
+var workflowPageQueryConfig = rest.NewQueryRouteConfig[string](nil, 20, 0)
 
 // NewRegistrar 创建 workflow HTTP 路由注册器。
 func NewRegistrar(service *workflowservice.Service) *Registrar {
@@ -614,15 +618,14 @@ func workItemPageQuery(ctx httpx.IContext) (int, int, error) {
 	if _, ok := ctx.QueryParams()["page_size"]; ok {
 		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow work item page_size is not supported; use size")
 	}
-	page, err := optionalPositiveIntQuery(ctx, "page")
+	options, err := rest.ParsePaginationOptions(ctx, workflowPageQueryConfig)
 	if err != nil {
 		return 0, 0, err
 	}
-	size, err := optionalPositiveIntQuery(ctx, "size")
-	if err != nil {
-		return 0, 0, err
+	if options.Size > 100 {
+		return 0, 0, errors.NewCode(errors.InvalidInput, "workflow work item size must not exceed 100")
 	}
-	return page, size, nil
+	return options.Page, options.Size, nil
 }
 
 func workItemQuery(ctx httpx.IContext) (workflowtypes.WorkItemQuery, error) {
@@ -655,18 +658,6 @@ func instanceQuery(ctx httpx.IContext) (workflowtypes.InstanceQuery, error) {
 	}, nil
 }
 
-func optionalPositiveIntQuery(ctx httpx.IContext, key string) (int, error) {
-	raw := strings.TrimSpace(ctx.Query(key))
-	if raw == "" {
-		return 0, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil || value <= 0 {
-		return 0, errors.NewCode(errors.InvalidInput, "workflow work item query is invalid").WithContext(key, raw)
-	}
-	return value, nil
-}
-
 func (r *Registrar) serviceContext(ctx httpx.IContext) (context.Context, error) {
 	reqCtx := ctx.RequestContext()
 	scopeID := iamauth.ActiveScopeIDFromContext(reqCtx)
@@ -696,7 +687,7 @@ func requiredParamValue(ctx httpx.IContext, key string, message string) (string,
 
 func paginateInstanceSummaries(items []workflowtypes.InstanceSummary, page int, size int) *workflowtypes.InstancePage {
 	total := len(items)
-	start := (page - 1) * size
+	start := (&query.PaginationOptions{Page: page, Size: size}).Offset()
 	if start >= total {
 		return &workflowtypes.InstancePage{Items: []workflowtypes.InstanceSummary{}, Total: total, Page: page, Size: size}
 	}
