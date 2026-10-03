@@ -1127,6 +1127,7 @@ func TestRegistrarPermissionMiddlewareBehavior(t *testing.T) {
 			SecretKey:       "workflow-test-secret",
 			TokenHeader:     "Authorization",
 			TokenPrefix:     "Bearer ",
+			Environment:     "test",
 			ContextResolver: workflowTestAuthResolver{},
 		})},
 	}
