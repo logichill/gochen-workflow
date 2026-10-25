@@ -5,8 +5,6 @@ import (
 	"reflect"
 	"testing"
 
-	iammw "gochen-iam/middleware"
-	iamservice "gochen-iam/service"
 	workflowpermissions "gochen-workflow/permissions"
 	"gochen-workflow/runtime/httpapi"
 	workflowservice "gochen-workflow/service"
@@ -98,32 +96,24 @@ func TestNewModuleRegistersWorkflowPermissionMetadata(t *testing.T) {
 	}
 }
 
-func TestWorkflowRoutesRegisterPermissionsInIAMStrictRegistry(t *testing.T) {
+func TestWorkflowRoutesRegisterWithoutErrors(t *testing.T) {
 	service := workflowservice.NewService(workflowservice.NewMemoryStore(), nil, nil)
 	registrar := httpapi.NewRegistrar(service)
 	if err := registrar.RegisterRoutes(&stubRouteGroup{}); err != nil {
 		t.Fatalf("RegisterRoutes failed: %v", err)
 	}
-
-	definitions := iammw.RequiredPermissionDefinitions()
-	run := findPermissionDefinition(definitions, workflowpermissions.WorkflowRunCode)
-	if run == nil {
-		t.Fatalf("missing workflow run permission in strict registry after route registration: %#v", definitions)
-	}
-	if run.Name != "流程实例推进" || run.RiskLevel != string(auth.PermissionRiskHigh) {
-		t.Fatalf("unexpected workflow run metadata in strict registry: %#v", *run)
-	}
 }
 
-// TestWorkflowCatalogSyncsMenuPermissionsIntoIAMStrictRegistry 覆盖完整装配链路：
-// 模块 Extension(Catalog) → CatalogRegistrar → authz Registry → IAM 同步钩子 → strict registry。
-//
-// 菜单可见性权限不挂任何 PermissionMiddleware，只能经这条链路进入 strict registry；
-// 缺了它，角色授予 workflow 菜单权限会被判为“未知权限”。
-func TestWorkflowCatalogSyncsMenuPermissionsIntoIAMStrictRegistry(t *testing.T) {
+// TestWorkflowCatalogSyncsMenuPermissionsIntoAuthzRegistry 覆盖完整装配链路：
+// 模块 Extension(Catalog) → CatalogRegistrar → authz Registry → 同步钩子。
+func TestWorkflowCatalogSyncsMenuPermissionsIntoAuthzRegistry(t *testing.T) {
 	registry := auth.NewRegistry()
-	if err := iamservice.InstallIAMPermissionCatalog(registry); err != nil {
-		t.Fatalf("InstallIAMPermissionCatalog: %v", err)
+	var mirrored []auth.PermissionDefinition
+	if err := registry.InstallModuleCatalogSync(func(reg auth.ModuleRegistration) error {
+		mirrored = append(mirrored, reg.PermissionDefinitions...)
+		return nil
+	}); err != nil {
+		t.Fatalf("InstallModuleCatalogSync: %v", err)
 	}
 
 	mod, err := NewModule()
@@ -142,18 +132,17 @@ func TestWorkflowCatalogSyncsMenuPermissionsIntoIAMStrictRegistry(t *testing.T) 
 		workflowpermissions.WorkflowMenuDesignerCode,
 		workflowpermissions.WorkflowRunCode,
 	} {
-		if !iammw.HasRequiredPermission(code) {
-			t.Fatalf("expected workflow permission %q mirrored into IAM strict registry", code)
+		if findPermissionDefinition(mirrored, code) == nil {
+			t.Fatalf("expected workflow permission %q mirrored into authz sync hook", code)
 		}
 	}
 
-	definitions := iammw.RequiredPermissionDefinitions()
-	menu := findPermissionDefinition(definitions, workflowpermissions.WorkflowMenuDesignerCode)
+	menu := findPermissionDefinition(mirrored, workflowpermissions.WorkflowMenuDesignerCode)
 	if menu == nil {
-		t.Fatalf("missing workflow menu definition in strict registry: %#v", definitions)
+		t.Fatalf("missing workflow menu definition in mirrored catalog: %#v", mirrored)
 	}
 	if !reflect.DeepEqual(menu.Scopes, []string{string(auth.PermissionScopePlatform), string(auth.PermissionScopeTenant)}) {
-		t.Fatalf("unexpected workflow menu scopes in strict registry: %#v", menu.Scopes)
+		t.Fatalf("unexpected workflow menu scopes in mirrored catalog: %#v", menu.Scopes)
 	}
 }
 

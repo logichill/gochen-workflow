@@ -288,6 +288,7 @@ type CreateInstanceInput struct {
 }
 
 type AdvanceNodeInput struct {
+	// NextNodeID 指定下一个目标节点。当前引擎仅支持单目标流转，NextNodeID 与 NextNodeIDs 均可使用。
 	NextNodeID       string     `json:"next_node_id,omitempty"`
 	NextNodeIDs      []string   `json:"next_node_ids,omitempty"`
 	AssigneeID       string     `json:"assignee_id,omitempty"`

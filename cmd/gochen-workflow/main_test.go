@@ -1,15 +1,21 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"gochen/gen/uuid"
+	"gochen/errors"
 
 	workflowpermissions "gochen-workflow/permissions"
 
-	iamauth "gochen-iam/auth"
-	iamconfig "gochen-iam/config"
-	iammw "gochen-iam/middleware"
 	auth "gochen-runtime/host/authz"
 	"gochen-runtime/http/nethttp"
 	"gochen/httpx"
@@ -79,10 +85,9 @@ func TestSQLiteStoreOptionsFromEnvRejectsInvalidScopeKind(t *testing.T) {
 
 func TestStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 	t.Setenv("APP_ENV", "test")
-	iammw.RegisterRequiredPermissions(workflowpermissions.WorkflowReadCode)
-	token, err := iammw.GenerateToken(7, 42, "binding-v1", []string{workflowpermissions.WorkflowReadCode}, "test-secret")
+	token, err := generateToken(7, 42, "binding-v1", []string{workflowpermissions.WorkflowReadCode}, "test-secret")
 	if err != nil {
-		t.Fatalf("GenerateToken returned error: %v", err)
+		t.Fatalf("generateToken returned error: %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/workflow/definitions", nil)
@@ -92,7 +97,7 @@ func TestStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 		t.Fatalf("NewBaseContext returned error: %v", err)
 	}
 
-	mw := iammw.AuthMiddleware(&iammw.AuthConfig{
+	mw := standaloneAuthMiddleware(&standaloneAuthConfig{
 		Environment:     "test",
 		ContextResolver: standaloneAuthContextResolver{},
 		SecretKey:       "test-secret",
@@ -101,7 +106,7 @@ func TestStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 	})
 	called := false
 	if err := mw(ctx, func() error { called = true; return nil }); err != nil {
-		t.Fatalf("AuthMiddleware returned error: %v", err)
+		t.Fatalf("standaloneAuthMiddleware returned error: %v", err)
 	}
 	if !called {
 		t.Fatal("expected next handler to be called")
@@ -113,15 +118,15 @@ func TestStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 	if principal.SubjectID != 7 || principal.ActiveScopeID != 42 {
 		t.Fatalf("unexpected principal: %+v", principal)
 	}
-	if got := iamauth.ActiveScopeKind(ctx.RequestContext()); got != string(iammw.ScopeTenant) {
-		t.Fatalf("active scope kind = %q, want %q", got, string(iammw.ScopeTenant))
+	if got := auth.ActiveScopeKindFromContext(ctx.RequestContext()); got != string(auth.PermissionScopeTenant) {
+		t.Fatalf("active scope kind = %q, want %q", got, string(auth.PermissionScopeTenant))
 	}
 }
 
 func TestWorkflowStandaloneAuthConfigRequiresSecret(t *testing.T) {
 	t.Setenv("AUTH_SECRET", "")
-	config := iamconfig.NewAuthConfig(iamconfig.ApplyEnvOverrides(iamconfig.DefaultRuntimeConfig()), "test")
-	if err := iammw.ValidateAuthConfig(config); err == nil {
+	config := defaultStandaloneAuthConfig("test")
+	if err := validateStandaloneAuthConfig(config); err == nil {
 		t.Fatal("expected missing AUTH_SECRET to fail")
 	}
 }
@@ -129,7 +134,7 @@ func TestWorkflowStandaloneAuthConfigRequiresSecret(t *testing.T) {
 func TestStandaloneRouteMiddlewaresAuthenticateBeforePermissions(t *testing.T) {
 	t.Setenv("APP_ENV", "test")
 	t.Setenv("AUTH_SECRET", "workflow-test-secret")
-	config := iamconfig.NewAuthConfig(iamconfig.ApplyEnvOverrides(iamconfig.DefaultRuntimeConfig()), "test")
+	config := defaultStandaloneAuthConfig("test")
 	config.ContextResolver = standaloneAuthContextResolver{}
 	middlewares := standaloneRouteMiddlewares(logging.NewNoopLogger(), config)
 	if len(middlewares) == 0 {
@@ -137,16 +142,16 @@ func TestStandaloneRouteMiddlewaresAuthenticateBeforePermissions(t *testing.T) {
 	}
 
 	chain := append([]httpx.Middleware{}, middlewares...)
-	chain = append(chain, iammw.PermissionMiddleware(workflowpermissions.WorkflowRead))
+	chain = append(chain, workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRead))
 	handler := func(ctx httpx.IContext) error {
 		return runMiddlewareChain(ctx, chain, func() error {
 			return ctx.JSON(http.StatusOK, httpx.JSONValue(map[string]any{"ok": true}))
 		})
 	}
 
-	token, err := iammw.GenerateToken(7, 42, "binding-v1", []string{workflowpermissions.WorkflowReadCode}, "workflow-test-secret")
+	token, err := generateToken(7, 42, "binding-v1", []string{workflowpermissions.WorkflowReadCode}, "workflow-test-secret")
 	if err != nil {
-		t.Fatalf("GenerateToken returned error: %v", err)
+		t.Fatalf("generateToken returned error: %v", err)
 	}
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/api/v1/workflow/definitions", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -174,4 +179,36 @@ func runMiddlewareChain(ctx httpx.IContext, middlewares []httpx.Middleware, fina
 		}
 	}
 	return next()
+}
+
+
+// generateToken 仅供测试签发 access token；生产路径只做校验，不携带签发能力。
+func generateToken(userID, activeScopeID int64, bindingVersion string, permissions []string, secretKey string) (string, error) {
+	if secretKey == "" {
+		return "", errors.NewCode(errors.Internal, "JWT 密钥未配置")
+	}
+	now := time.Now()
+	headerJSON, err := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
+	if err != nil {
+		return "", errors.NewCode(errors.Internal, "生成token失败")
+	}
+	claims := jwtClaims{
+		TokenType:      "access",
+		UserID:         userID,
+		ActiveScopeID:  activeScopeID,
+		BindingVersion: strings.TrimSpace(bindingVersion),
+		Permissions:    permissions,
+		ID:             uuid.NewString(),
+		ExpiresAt:      now.Add(defaultAccessTokenTTL).Unix(),
+		IssuedAt:       now.Unix(),
+	}
+	payloadJSON, err := json.Marshal(claims)
+	if err != nil {
+		return "", errors.NewCode(errors.Internal, "生成token失败")
+	}
+	unsigned := base64.RawURLEncoding.EncodeToString(headerJSON) + "." + base64.RawURLEncoding.EncodeToString(payloadJSON)
+	mac := hmac.New(sha256.New, []byte(secretKey))
+	_, _ = mac.Write([]byte(unsigned))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return unsigned + "." + sig, nil
 }

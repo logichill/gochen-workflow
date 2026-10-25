@@ -94,15 +94,12 @@ func (s *Service) BuildDefinitionListResponseWithQuery(ctx context.Context, quer
 	if err := validateDefinitionStatus(query.Status); err != nil {
 		return nil, err
 	}
-	normalizedQuery := definitionListQuery{
-		page:    page,
-		size:    size,
-		offset:  (&appquery.PaginationOptions{Page: page, Size: size}).Offset(),
-		keyword: strings.ToLower(strings.TrimSpace(query.Keyword)),
-		status:  query.Status,
+	normalizedQuery := workflowtypes.DefinitionQuery{
+		Page: page, Size: size,
+		Keyword: strings.ToLower(strings.TrimSpace(query.Keyword)), Status: query.Status,
 	}
-	if queryStore, ok := s.store.(definitionQueryStore); ok {
-		return queryStore.queryDesigns(ctx, normalizedQuery)
+	if queryStore, ok := s.store.(DefinitionQueryStore); ok {
+		return queryStore.QueryDesigns(ctx, normalizedQuery)
 	}
 
 	items, err := s.ListDefinitions(ctx)
@@ -116,7 +113,7 @@ func (s *Service) BuildDefinitionListResponseWithQuery(ctx context.Context, quer
 		return nil, err
 	}
 	total := len(filtered)
-	start := normalizedQuery.offset
+	start := (&appquery.PaginationOptions{Page: page, Size: size}).Offset()
 	if start >= total {
 		filtered = []*workflowtypes.DesignerDefinition{}
 	} else {
@@ -453,8 +450,6 @@ func (s *Service) CreateInstanceWithOptions(ctx context.Context, input workflowt
 	if assignment := assignmentFromInput(input.AssigneeID, input.AssigneeName, input.CandidateUserIDs, input.CandidateRoleIDs, nil, input.DueAt); !emptyAssignment(assignment) {
 		meta.TaskAssignments["*"] = assignment
 	}
-	s.definitionMu.Lock()
-	defer s.definitionMu.Unlock()
 
 	design, err := s.GetDefinition(ctx, definitionID)
 	if err != nil {
@@ -513,6 +508,11 @@ func (s *Service) CompleteNode(ctx context.Context, id runtime.ID, nodeID string
 }
 
 func (s *Service) completeNodeWithAction(ctx context.Context, id runtime.ID, nodeID string, input workflowtypes.AdvanceNodeInput, action string) (*runtime.State, error) {
+	if nextNodeID, selected, err := selectedNextNodeFromInput(input); err != nil {
+		return nil, err
+	} else if selected {
+		return s.completeNodeToWithAction(ctx, id, nodeID, nextNodeID, input, action)
+	}
 	if err := s.validateReady(ctx); err != nil {
 		return nil, err
 	}
@@ -530,6 +530,28 @@ func (s *Service) completeNodeWithAction(ctx context.Context, id runtime.ID, nod
 		return nil, err
 	}
 	return s.GetInstance(ctx, id)
+}
+
+func selectedNextNodeFromInput(input workflowtypes.AdvanceNodeInput) (string, bool, error) {
+	single := strings.TrimSpace(input.NextNodeID)
+	if len(input.NextNodeIDs) == 0 {
+		if single != "" {
+			return single, true, nil
+		}
+		return "", false, nil
+	}
+	if len(input.NextNodeIDs) > 1 {
+		return "", false, errors.NewCode(errors.InvalidInput, "workflow selected next nodes must contain at most one node").
+			WithContext("selected_count", len(input.NextNodeIDs))
+	}
+	fromList := strings.TrimSpace(input.NextNodeIDs[0])
+	if fromList == "" {
+		return "", false, errors.NewCode(errors.InvalidInput, "workflow selected next node is empty")
+	}
+	if single != "" && single != fromList {
+		return "", false, errors.NewCode(errors.InvalidInput, "workflow next_node_id and next_node_ids must match when both are provided")
+	}
+	return fromList, true, nil
 }
 
 func (s *Service) AdvanceNodeTo(ctx context.Context, id runtime.ID, nodeID string, nextNodeID string) (*runtime.State, error) {
@@ -559,6 +581,11 @@ func (s *Service) completeNodeToWithAction(ctx context.Context, id runtime.ID, n
 	}
 	if nextNodeID == "" {
 		return nil, errors.NewCode(errors.InvalidInput, "workflow selected next node is empty")
+	}
+	if fromInput, has, err := selectedNextNodeFromInput(input); err != nil {
+		return nil, err
+	} else if has && fromInput != nextNodeID {
+		return nil, errors.NewCode(errors.InvalidInput, "workflow next_node_id and target next_node_id must match when both are provided")
 	}
 	if err := s.engine.AdvanceNodeToWithMutation(ctx, id, nodeID, nextNodeID, func(st *runtime.State, now time.Time) error {
 		return s.applyNodeCompletedMetadata(ctx, st, nodeID, input, action, now)
@@ -611,9 +638,7 @@ func (s *Service) GetInstance(ctx context.Context, id runtime.ID) (*runtime.Stat
 }
 
 func (s *Service) ListMyStartedInstances(ctx context.Context, query workflowtypes.InstanceQuery) (*workflowtypes.InstancePage, error) {
-	if query.InitiatorID == "" {
-		query.InitiatorID = currentPrincipalID(ctx)
-	}
+	query.InitiatorID = currentPrincipalID(ctx)
 	if query.InitiatorID == "" {
 		return nil, errors.NewCode(errors.Unauthorized, "workflow principal is required")
 	}
@@ -675,9 +700,7 @@ func (s *Service) ListTodoItems(ctx context.Context, page int, size int) (*workf
 }
 
 func (s *Service) ListMyTodoItems(ctx context.Context, query workflowtypes.WorkItemQuery) (*workflowtypes.WorkItemPage, error) {
-	if query.UserID == "" {
-		query.UserID = currentPrincipalID(ctx)
-	}
+	query.UserID = currentPrincipalID(ctx)
 	if query.UserID == "" {
 		return nil, errors.NewCode(errors.Unauthorized, "workflow principal is required")
 	}
@@ -696,7 +719,12 @@ func (s *Service) listTodoItemsByQuery(ctx context.Context, query workflowtypes.
 	if err != nil {
 		return nil, err
 	}
-	instances, err := s.store.ListInstances(ctx)
+	var instances []*runtime.State
+	if queryStore, ok := s.store.(RunningInstanceStore); ok {
+		instances, err = queryStore.ListRunningInstances(ctx)
+	} else {
+		instances, err = s.store.ListInstances(ctx)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -714,7 +742,7 @@ func (s *Service) listTodoItemsByQuery(ctx context.Context, query workflowtypes.
 			if nodeID == "" {
 				continue
 			}
-			item := s.workItemFromState(st, definitions, "todo", nodeID, st.UpdatedAt)
+			item := s.workItemFromState(st, definitions, "todo", nodeID, st.UpdatedAt, workflowtypes.WorkflowAction{})
 			if workItemMatches(item, query, actorRoles) {
 				items = append(items, item)
 			}
@@ -732,9 +760,7 @@ func (s *Service) ListDoneItems(ctx context.Context, page int, size int) (*workf
 }
 
 func (s *Service) ListMyDoneItems(ctx context.Context, query workflowtypes.WorkItemQuery) (*workflowtypes.WorkItemPage, error) {
-	if query.UserID == "" {
-		query.UserID = currentPrincipalID(ctx)
-	}
+	query.UserID = currentPrincipalID(ctx)
 	if query.UserID == "" {
 		return nil, errors.NewCode(errors.Unauthorized, "workflow principal is required")
 	}
@@ -749,21 +775,38 @@ func (s *Service) ListDoneItemsByQuery(ctx context.Context, query workflowtypes.
 	if err != nil {
 		return nil, err
 	}
-	instances, err := s.store.ListInstances(ctx)
+	instances, err := s.store.ListStartedInstances(ctx)
 	if err != nil {
 		return nil, err
 	}
-	definitions, err := s.definitionMetasForStates(ctx, instances)
-	if err != nil {
-		return nil, err
-	}
-	items := make([]workflowtypes.WorkItem, 0)
+
+	targetDefID := strings.TrimSpace(query.DefinitionID)
+	candidateStates := make([]*runtime.State, 0, len(instances))
 	for _, st := range instances {
 		if st == nil {
 			continue
 		}
+		if targetDefID != "" && st.DefinitionID != targetDefID {
+			continue
+		}
+		if len(st.History) == 0 && len(st.CompletedNodeIDs) == 0 {
+			continue
+		}
+		candidateStates = append(candidateStates, st)
+	}
+
+	definitions, err := s.definitionMetasForStates(ctx, candidateStates)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]workflowtypes.WorkItem, 0)
+	for _, st := range candidateStates {
+		if st == nil {
+			continue
+		}
 		seen := map[string]struct{}{}
-		for _, entry := range st.History {
+		actions := completionActionsForHistory(st)
+		for historyIndex, entry := range st.History {
 			if !isNodeCompletionAction(entry.Action) {
 				continue
 			}
@@ -772,7 +815,9 @@ func (s *Service) ListDoneItemsByQuery(ctx context.Context, query workflowtypes.
 				continue
 			}
 			seen[nodeID] = struct{}{}
-			item := s.workItemFromState(st, definitions, "done", nodeID, entry.At)
+			item := s.workItemFromState(st, definitions, "done", nodeID, entry.At, actions[historyIndex])
+			// 驳回重办会为同一节点产生多条已办记录，历史序号提供稳定且唯一的列表 ID。
+			item.ID = fmt.Sprintf("%s:%d", item.ID, historyIndex)
 			if workItemMatches(item, query, nil) {
 				items = append(items, item)
 			}
@@ -785,7 +830,13 @@ func (s *Service) ListDoneItemsByQuery(ctx context.Context, query workflowtypes.
 			if _, ok := seen[nodeID]; ok {
 				continue
 			}
-			item := s.workItemFromState(st, definitions, "done", nodeID, st.UpdatedAt)
+			seen[nodeID] = struct{}{}
+			action := uniqueCompletionAction(metadataFromState(st), nodeID, st.UpdatedAt)
+			eventAt := action.At
+			if eventAt.IsZero() {
+				eventAt = st.UpdatedAt
+			}
+			item := s.workItemFromState(st, definitions, "done", nodeID, eventAt, action)
 			if workItemMatches(item, query, nil) {
 				items = append(items, item)
 			}
@@ -822,6 +873,8 @@ func (s *Service) ClaimTask(ctx context.Context, id runtime.ID, nodeID string, i
 	now := s.clock.Now().UTC()
 	current.AssigneeID = actorID
 	current.AssigneeName = strings.TrimSpace(input.AssigneeName)
+	current.DelegatorID = ""
+	current.DelegatorName = ""
 	current.ClaimedAt = &now
 	current.UpdatedAt = &now
 	meta.TaskAssignments[nodeID] = current
@@ -847,14 +900,16 @@ func (s *Service) UnclaimTask(ctx context.Context, id runtime.ID, nodeID string,
 	if current.AssigneeID == "" {
 		return cloneState(st), nil
 	}
-	if current.AssigneeID != actorID {
-		return nil, errors.NewCode(errors.Forbidden, "workflow task can only be unclaimed by current assignee").
+	if current.AssigneeID != actorID && current.DelegatorID != actorID {
+		return nil, errors.NewCode(errors.Forbidden, "workflow task can only be unclaimed by current assignee or delegator").
 			WithContext("instance_id", string(id)).
 			WithContext("node_id", nodeID)
 	}
 	now := s.clock.Now().UTC()
 	current.AssigneeID = ""
 	current.AssigneeName = ""
+	current.DelegatorID = ""
+	current.DelegatorName = ""
 	current.ClaimedAt = nil
 	current.UpdatedAt = &now
 	meta.TaskAssignments[nodeID] = current
@@ -1036,7 +1091,7 @@ func (s *Service) WithdrawInstance(ctx context.Context, id runtime.ID, input wor
 		return nil, err
 	}
 	meta := metadataFromState(st)
-	if meta.InitiatorID != "" && meta.InitiatorID != actorID {
+	if meta.InitiatorID == "" || meta.InitiatorID != actorID {
 		return nil, errors.NewCode(errors.Forbidden, "workflow instance can only be withdrawn by initiator").
 			WithContext("instance_id", string(id))
 	}
@@ -1115,12 +1170,15 @@ func (s *Service) workItemFromState(
 	itemType string,
 	nodeID string,
 	eventAt time.Time,
+	action workflowtypes.WorkflowAction,
 ) workflowtypes.WorkItem {
 	meta := definitions[st.DefinitionID]
 	node := meta.nodes[nodeID]
 	instanceMeta := metadataFromState(st)
 	assignment := assignmentForNode(instanceMeta, nodeID)
-	action := actionForNode(instanceMeta, itemType, nodeID, eventAt)
+	if itemType == "done" && action.Action == "" {
+		action.Action = "complete"
+	}
 	if eventAt.IsZero() {
 		eventAt = st.UpdatedAt
 	}
@@ -1407,17 +1465,69 @@ func appendTargetAction(meta *workflowtypes.InstanceMetadata, action string, nod
 	})
 }
 
-func actionForNode(meta workflowtypes.InstanceMetadata, itemType string, nodeID string, eventAt time.Time) workflowtypes.WorkflowAction {
-	if itemType != "done" {
-		return workflowtypes.WorkflowAction{}
+// completionActionsForHistory pairs repeated completions by persisted order, not timestamp uniqueness.
+// Incomplete legacy metadata cannot identify an occurrence safely, so its actor remains unknown.
+func completionActionsForHistory(st *runtime.State) map[int]workflowtypes.WorkflowAction {
+	type completionKey struct {
+		nodeID string
+		at     time.Time
 	}
-	for i := len(meta.Actions) - 1; i >= 0; i-- {
-		action := meta.Actions[i]
-		if action.NodeID == nodeID && isNodeCompletionAction(action.Action) {
-			return action
+	key := func(nodeID string, at time.Time) completionKey {
+		return completionKey{strings.TrimSpace(nodeID), at.UTC().Round(0)}
+	}
+	histories := make(map[completionKey][]int)
+	for i, entry := range st.History {
+		if isNodeCompletionAction(entry.Action) && strings.TrimSpace(entry.NodeID) != "" {
+			k := key(entry.NodeID, entry.At)
+			histories[k] = append(histories[k], i)
 		}
 	}
-	return workflowtypes.WorkflowAction{Action: "complete", NodeID: nodeID, At: eventAt}
+	actions := make(map[completionKey][]workflowtypes.WorkflowAction)
+	for _, action := range metadataFromState(st).Actions {
+		if isNodeCompletionAction(action.Action) {
+			k := key(action.NodeID, action.At)
+			actions[k] = append(actions[k], action)
+		}
+	}
+	result := make(map[int]workflowtypes.WorkflowAction)
+	for k, indices := range histories {
+		matches := actions[k]
+		if len(matches) != len(indices) {
+			continue
+		}
+		for i, index := range indices {
+			result[index] = matches[i]
+		}
+	}
+	return result
+}
+
+// Legacy states without node history may only use an unambiguous completion action.
+func uniqueCompletionAction(meta workflowtypes.InstanceMetadata, nodeID string, eventAt time.Time) workflowtypes.WorkflowAction {
+	var (
+		match     workflowtypes.WorkflowAction
+		atMatch   workflowtypes.WorkflowAction
+		total     int
+		atMatches int
+	)
+	for _, action := range meta.Actions {
+		if action.NodeID != nodeID || !isNodeCompletionAction(action.Action) {
+			continue
+		}
+		total++
+		match = action
+		if !eventAt.IsZero() && action.At.Equal(eventAt) {
+			atMatches++
+			atMatch = action
+		}
+	}
+	if total == 1 {
+		return match
+	}
+	if atMatches == 1 {
+		return atMatch
+	}
+	return workflowtypes.WorkflowAction{}
 }
 
 func isNodeCompletionAction(action string) bool {
@@ -1460,16 +1570,8 @@ func actorCanTakeAssignment(assignment workflowtypes.TaskAssignment, actorID str
 	if actorID == "" {
 		return false
 	}
-	if len(assignment.CandidateUserIDs) > 0 {
-		return containsString(assignment.CandidateUserIDs, actorID)
-	}
-	if len(assignment.CandidateRoleIDs) > 0 {
-		for _, roleID := range assignment.CandidateRoleIDs {
-			if containsString(actorRoles, roleID) {
-				return true
-			}
-		}
-		return false
+	if len(assignment.CandidateUserIDs) > 0 || len(assignment.CandidateRoleIDs) > 0 {
+		return containsString(assignment.CandidateUserIDs, actorID) || containsAnyString(assignment.CandidateRoleIDs, actorRoles)
 	}
 	return true
 }
@@ -1726,7 +1828,14 @@ func workItemMatches(item workflowtypes.WorkItem, query workflowtypes.WorkItemQu
 	if userID != "" {
 		switch item.Type {
 		case "todo":
-			if item.AssigneeID != userID && !containsString(item.CandidateUserIDs, userID) && !containsAnyString(item.CandidateRoleIDs, actorRoles) {
+			// 已认领任务只属于当前处理人；未认领任务的用户和角色候选取并集。
+			if item.AssigneeID != "" {
+				if item.AssigneeID != userID {
+					return false
+				}
+				break
+			}
+			if !containsString(item.CandidateUserIDs, userID) && !containsAnyString(item.CandidateRoleIDs, actorRoles) {
 				return false
 			}
 		case "done":
@@ -1812,7 +1921,10 @@ func compareWorkItems(left workflowtypes.WorkItem, right workflowtypes.WorkItem)
 	if left.InstanceID != right.InstanceID {
 		return left.InstanceID < right.InstanceID
 	}
-	return left.NodeID < right.NodeID
+	if left.NodeID != right.NodeID {
+		return left.NodeID < right.NodeID
+	}
+	return left.ID < right.ID
 }
 
 func (s *Service) validateReady(ctx context.Context) error {

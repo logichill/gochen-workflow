@@ -2091,6 +2091,25 @@ func TestServiceWithdrawInstanceByInitiator(t *testing.T) {
 	if state.Status != "withdrawn" || len(state.ActiveNodeIDs) != 0 {
 		t.Fatalf("withdrawn state = %#v", state)
 	}
+
+	// Verify that an instance with empty InitiatorID cannot be withdrawn by anyone
+	created2, err := service.CreateInstanceWithOptions(baseCtx, workflowtypes.CreateInstanceInput{ID: "withdraw-no-initiator", DefinitionID: saved.ID})
+	if err != nil {
+		t.Fatalf("create instance 2: %v", err)
+	}
+	st2, err := service.GetInstance(baseCtx, created2.ID)
+	if err != nil {
+		t.Fatalf("get instance 2: %v", err)
+	}
+	m2 := metadataFromState(st2)
+	m2.InitiatorID = ""
+	saveMetadata(st2, m2, time.Now())
+	if err := service.store.SaveIfVersion(baseCtx, st2, st2.Version); err != nil {
+		t.Fatalf("save instance 2: %v", err)
+	}
+	if _, err := service.WithdrawInstance(initiatorCtx, created2.ID, workflowtypes.TaskActionInput{}); err == nil || !errors.Is(err, errors.Forbidden) {
+		t.Fatalf("expected empty initiator withdraw forbidden, got %v", err)
+	}
 }
 
 func TestServiceWorkflowCenterSLADelegationReminderAndCC(t *testing.T) {
@@ -2159,6 +2178,20 @@ func TestServiceWorkflowCenterSLADelegationReminderAndCC(t *testing.T) {
 	}
 	if instances.Total != 1 || instances.Items[0].EarliestDueAt == nil || instances.Items[0].OverdueCount != 1 {
 		t.Fatalf("instance summary = %#v", instances)
+	}
+
+	// AUD-30: Delegator (2002) can unclaim (recall) the delegated task and Delegator info is cleared.
+	if _, err := service.UnclaimTask(approverCtx, created.ID, "start", workflowtypes.TaskActionInput{Comment: "撤回委托"}); err != nil {
+		t.Fatalf("delegator recall task: %v", err)
+	}
+	detail, err := service.GetInstance(initiatorCtx, created.ID)
+	if err != nil {
+		t.Fatalf("get instance: %v", err)
+	}
+	meta := metadataFromState(detail)
+	assignment := meta.TaskAssignments["start"]
+	if assignment.AssigneeID != "" || assignment.DelegatorID != "" || assignment.DelegatorName != "" {
+		t.Fatalf("expected cleared assignment after recall, got %#v", assignment)
 	}
 }
 
@@ -2499,8 +2532,8 @@ func TestStore_MultiVersionDefinitionRetrievalAndInstanceRecovery(t *testing.T) 
 				t.Fatalf("expected v2 design description %q, got %q", v2Design.Description, designAfterV3Delete.Description)
 			}
 			// 列表筛选与统计走 name/status 列而非 graph_json，列残留会让筛选结果与设计态不一致。
-			if queryStore, ok := store.(definitionQueryStore); ok {
-				listed, err := queryStore.queryDesigns(ctx, definitionListQuery{page: 1, size: 10})
+			if queryStore, ok := store.(DefinitionQueryStore); ok {
+				listed, err := queryStore.QueryDesigns(ctx, workflowtypes.DefinitionQuery{Page: 1, Size: 10})
 				if err != nil {
 					t.Fatalf("query designs after v3 delete: %v", err)
 				}
@@ -2771,5 +2804,167 @@ func TestSQLiteStoreMigrationPinsLegacyInstancesToDefinitionVersion(t *testing.T
 		if st.DefinitionVersion != want {
 			t.Fatalf("%s definition_version = %d, want %d", id, st.DefinitionVersion, want)
 		}
+	}
+}
+
+type mockFailStore struct {
+	Store
+	failSaveDesign    error
+	failSaveIfVersion error
+	failGet           error
+	returnNilGet      bool
+}
+
+func (m *mockFailStore) SaveDesign(ctx context.Context, design *workflowtypes.DesignerDefinition, runtimeDef *runtime.Definition) error {
+	if m.failSaveDesign != nil {
+		return m.failSaveDesign
+	}
+	return m.Store.SaveDesign(ctx, design, runtimeDef)
+}
+
+func (m *mockFailStore) SaveIfVersion(ctx context.Context, state *runtime.State, version uint64) error {
+	if m.failSaveIfVersion != nil {
+		return m.failSaveIfVersion
+	}
+	return m.Store.SaveIfVersion(ctx, state, version)
+}
+
+func (m *mockFailStore) Get(ctx context.Context, id runtime.ID) (*runtime.State, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if m.failGet != nil {
+		return nil, m.failGet
+	}
+	if m.returnNilGet {
+		return nil, nil
+	}
+	return m.Store.Get(ctx, id)
+}
+
+type mockFailIDGen struct {
+	err error
+}
+
+func (m *mockFailIDGen) Next() (string, error) {
+	return "", m.err
+}
+
+func TestServiceStoreFailureInjection(t *testing.T) {
+	ctx := context.Background()
+	injectedErr := errors.New("database disconnected")
+
+	// 1. SaveDesign failure
+	memStore := NewMemoryStore()
+	failStore := &mockFailStore{
+		Store:          memStore,
+		failSaveDesign: injectedErr,
+	}
+	svc := newTestService(failStore)
+	_, err := svc.SaveDefinition(ctx, sampleDesign())
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected injected SaveDesign failure, got %v", err)
+	}
+
+	// 2. Get failure
+	failStore = &mockFailStore{
+		Store:   memStore,
+		failGet: injectedErr,
+	}
+	svc = newTestService(failStore)
+	_, err = svc.GetInstance(ctx, "nonexistent")
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected injected Get failure, got %v", err)
+	}
+
+	// 3. SaveIfVersion failure
+	normalSvc := newTestService(memStore)
+	def, err := normalSvc.SaveDefinition(ctx, sampleDesign())
+	if err != nil {
+		t.Fatalf("setup save definition: %v", err)
+	}
+	_, err = normalSvc.PublishDefinition(ctx, def.ID)
+	if err != nil {
+		t.Fatalf("setup publish definition: %v", err)
+	}
+	inst, err := normalSvc.CreateInstance(ctx, "inst-fail-save", def.ID, nil)
+	if err != nil {
+		t.Fatalf("setup create instance: %v", err)
+	}
+	// 启动后 start 才是可认领节点；不存在的节点会在写库前被拒绝。
+	started, err := normalSvc.StartInstance(ctx, inst.ID)
+	if err != nil {
+		t.Fatalf("setup start instance: %v", err)
+	}
+
+	failStore = &mockFailStore{
+		Store:             memStore,
+		failSaveIfVersion: injectedErr,
+	}
+	svc = newTestService(failStore)
+	adminCtx, err := auth.WithPrincipal(context.Background(), auth.Principal{
+		SubjectID:     1,
+		ActiveScopeID: 1,
+		Roles:         []string{"admin"},
+	})
+	if err != nil {
+		t.Fatalf("setup auth principal: %v", err)
+	}
+	_, err = svc.ClaimTask(adminCtx, inst.ID, "start", workflowtypes.TaskActionInput{})
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected injected SaveIfVersion failure during ClaimTask, got %v", err)
+	}
+	persisted, err := normalSvc.GetInstance(ctx, inst.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := metadataFromState(persisted)
+	if persisted.Version != started.Version || meta.TaskAssignments["start"].AssigneeID != "" || len(meta.Actions) != len(metadataFromState(started).Actions) {
+		t.Fatal("failed claim persisted assignment, action history or version")
+	}
+	if _, err := normalSvc.ClaimTask(adminCtx, inst.ID, "start", workflowtypes.TaskActionInput{}); err != nil {
+		t.Fatalf("claim after storage recovery: %v", err)
+	}
+
+	// 4. SaveDefinition ID generator error (service.go:259)
+	idGenErr := errors.New("id generator exhausted")
+	failIDSvc := NewService(memStore, &mockFailIDGen{err: idGenErr}, nil)
+	emptyIDDesign := sampleDesign()
+	emptyIDDesign.ID = ""
+	_, err = failIDSvc.SaveDefinition(ctx, emptyIDDesign)
+	if !errors.Is(err, idGenErr) {
+		t.Fatalf("expected injected ID generator failure from SaveDefinition, got %v", err)
+	}
+
+	// 5. CreateInstanceWithOptions ID generator error (service.go:432)
+	_, err = failIDSvc.CreateInstanceWithOptions(ctx, workflowtypes.CreateInstanceInput{
+		ID:           "",
+		DefinitionID: def.ID,
+	})
+	if !errors.Is(err, idGenErr) {
+		t.Fatalf("expected injected ID generator failure from CreateInstanceWithOptions, got %v", err)
+	}
+
+	// 6. CreateInstanceWithOptions nil state after save (service.go:481)
+	nilGetStore := &mockFailStore{
+		Store:        memStore,
+		returnNilGet: true,
+	}
+	nilGetSvc := newTestService(nilGetStore)
+	_, err = nilGetSvc.CreateInstanceWithOptions(ctx, workflowtypes.CreateInstanceInput{
+		ID:           "inst-nil-get",
+		DefinitionID: def.ID,
+	})
+	if !errors.Is(err, errors.Internal) {
+		t.Fatalf("expected Internal when instance is not saved (nil returned from Get), got %v", err)
+	}
+
+	// 7. Context cancellation
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctxSvc := newTestService(&mockFailStore{Store: memStore})
+	_, err = ctxSvc.GetInstance(canceledCtx, inst.ID)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled context on GetInstance, got %v", err)
 	}
 }

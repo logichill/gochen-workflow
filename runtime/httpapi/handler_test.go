@@ -14,8 +14,6 @@ import (
 	workflowservice "gochen-workflow/service"
 	workflowtypes "gochen-workflow/types"
 
-	iamauth "gochen-iam/auth"
-	iammw "gochen-iam/middleware"
 	auth "gochen-runtime/host/authz"
 	"gochen-runtime/http/nethttp"
 	"gochen/httpx"
@@ -115,7 +113,7 @@ func TestRegistrarCreateInstanceUsesAuthenticatedPrincipal(t *testing.T) {
 		t.Fatalf("new unauthenticated context: %v", err)
 	}
 	httpCtx.SetContext(httpCtx.RequestContext().WithContext(
-		iamauth.BindActiveScopeContext(httpCtx.RequestContext(), 1, workflowservice.ScopeKindTenant)))
+		auth.BindActiveScopeContext(httpCtx.RequestContext(), 1, workflowservice.ScopeKindTenant)))
 	if err := handlers["POST /instances"](httpCtx); err != nil {
 		_ = nethttp.WriteErrorResponse(httpCtx, err)
 	}
@@ -996,9 +994,49 @@ func TestAdvanceNodeRejectsAmbiguousSelectedNextNodePayload(t *testing.T) {
 	advanceResp := doJSON(t, handlers["POST /instances/:id/nodes/:node_id/advance"], map[string]string{
 		"id":      "choice-ambiguous",
 		"node_id": "review",
-	}, map[string]any{"next_node_id": "approved", "next_node_ids": []string{"approved"}})
+	}, map[string]any{"next_node_id": "approved", "next_node_ids": []string{"rejected"}})
 	if advanceResp.Code != http.StatusBadRequest {
 		t.Fatalf("advance status = %d, want 400 body=%s", advanceResp.Code, advanceResp.Body.String())
+	}
+}
+
+func TestAdvanceNodeAllowsMatchingDualWriteSelectedNextNodePayload(t *testing.T) {
+	service := workflowservice.NewService(workflowservice.NewMemoryStore(), nil, nil)
+	handlers := registerTestRoutes(t, NewRegistrar(service))
+	payload := map[string]any{
+		"id":            "approval-choice-dual",
+		"name":          "Approval Choice Dual",
+		"start_node_id": "review",
+		"nodes": []map[string]any{
+			{"id": "review", "name": "Review", "type": "branch", "next": []string{"approved", "rejected"}, "position": map[string]any{"x": 0, "y": 0}},
+			{"id": "approved", "name": "Approved", "next": []string{}, "position": map[string]any{"x": 120, "y": -40}},
+			{"id": "rejected", "name": "Rejected", "next": []string{}, "position": map[string]any{"x": 120, "y": 40}},
+		},
+		"edges": []map[string]any{
+			{"id": "approved-edge", "source": "review", "target": "approved"},
+			{"id": "rejected-edge", "source": "review", "target": "rejected"},
+		},
+	}
+
+	if resp := doJSON(t, handlers["POST /definitions"], nil, payload); resp.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if resp := doJSON(t, handlers["POST /definitions/:id/publish"], map[string]string{"id": "approval-choice-dual"}, nil); resp.Code != http.StatusOK {
+		t.Fatalf("publish status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if resp := doJSON(t, handlers["POST /instances"], nil, map[string]any{"id": "choice-dual-1", "definition_id": "approval-choice-dual"}); resp.Code != http.StatusCreated {
+		t.Fatalf("instance status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if resp := doJSON(t, handlers["POST /instances/:id/start"], map[string]string{"id": "choice-dual-1"}, nil); resp.Code != http.StatusOK {
+		t.Fatalf("start status = %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	advanceResp := doJSON(t, handlers["POST /instances/:id/nodes/:node_id/advance"], map[string]string{
+		"id":      "choice-dual-1",
+		"node_id": "review",
+	}, map[string]any{"next_node_id": "approved", "next_node_ids": []string{"approved"}})
+	if advanceResp.Code != http.StatusOK {
+		t.Fatalf("advance status = %d, want 200 body=%s", advanceResp.Code, advanceResp.Body.String())
 	}
 }
 
@@ -1119,17 +1157,10 @@ func TestRegistrarAppliesPermissionMiddlewareGroups(t *testing.T) {
 }
 
 func TestRegistrarPermissionMiddlewareBehavior(t *testing.T) {
-	t.Setenv("APP_ENV", "test")
 	service := workflowservice.NewService(workflowservice.NewMemoryStore(), nil, nil)
 	group := &middlewareGroup{
-		handlers: map[string]httpx.Handler{},
-		middlewares: []httpx.Middleware{iammw.AuthMiddleware(&iammw.AuthConfig{
-			SecretKey:       "workflow-test-secret",
-			TokenHeader:     "Authorization",
-			TokenPrefix:     "Bearer ",
-			Environment:     "test",
-			ContextResolver: workflowTestAuthResolver{},
-		})},
+		handlers:    map[string]httpx.Handler{},
+		middlewares: []httpx.Middleware{workflowTestAuthMiddleware()},
 	}
 	if err := NewRegistrar(service).RegisterRoutes(group); err != nil {
 		t.Fatalf("RegisterRoutes failed: %v", err)
@@ -1141,7 +1172,7 @@ func TestRegistrarPermissionMiddlewareBehavior(t *testing.T) {
 	}
 
 	t.Run("rejects unauthenticated request", func(t *testing.T) {
-		rec := doRaw(t, readHandler, nil, "")
+		rec := doRawWithoutScope(t, readHandler, nil, "")
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401 body=%s", rec.Code, rec.Body.String())
 		}
@@ -1163,6 +1194,67 @@ func TestRegistrarPermissionMiddlewareBehavior(t *testing.T) {
 		}
 		assertMessageCode(t, rec, "ok")
 	})
+}
+
+// Regression（R3e-F01）：handler.go 曾声明无任何调用者的 paginateInstanceSummaries
+// （实例分页实际由 service.ListInstances 承担），该死代码同时是 gochen/app/query 导入的唯一使用者。
+// 本用例固定存活分页路径 GET /instances 的真实语义（跨页不重复、total 稳定），
+// 防止把已删除的手写分页辅助重新接回 handler 时改变行为。
+func TestRegistrarListInstancesPaginationServesPagesAfterDeadHelperRemoval(t *testing.T) {
+	service := workflowservice.NewService(workflowservice.NewMemoryStore(), nil, nil)
+	handlers := registerTestRoutes(t, NewRegistrar(service))
+	payload := map[string]any{
+		"id":            "pagination-live",
+		"name":          "Pagination Live",
+		"start_node_id": "start",
+		"nodes": []map[string]any{
+			{"id": "start", "name": "Start", "next": []string{"end"}, "position": map[string]any{"x": 0, "y": 0}},
+			{"id": "end", "name": "End", "next": []string{}, "position": map[string]any{"x": 120, "y": 0}},
+		},
+		"edges": []map[string]any{{"id": "pagination-edge", "source": "start", "target": "end"}},
+	}
+	if resp := doJSON(t, handlers["POST /definitions"], nil, payload); resp.Code != http.StatusCreated {
+		t.Fatalf("create definition status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if resp := doJSON(t, handlers["POST /definitions/:id/publish"], map[string]string{"id": "pagination-live"}, nil); resp.Code != http.StatusOK {
+		t.Fatalf("publish definition status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	for _, id := range []string{"pagination-live-1", "pagination-live-2", "pagination-live-3"} {
+		if resp := doJSON(t, handlers["POST /instances"], nil, map[string]any{"id": id, "definition_id": "pagination-live"}); resp.Code != http.StatusCreated {
+			t.Fatalf("create instance %s status = %d body=%s", id, resp.Code, resp.Body.String())
+		}
+	}
+
+	first := doGetAsUser(t, handlers["GET /instances"], "/?page=1&size=2", 1001)
+	if first.Code != http.StatusOK {
+		t.Fatalf("page 1 status = %d body=%s", first.Code, first.Body.String())
+	}
+	var firstPage workflowtypes.InstancePage
+	decodeResponseData(t, first, &firstPage)
+	if firstPage.Total != 3 || firstPage.Page != 1 || firstPage.Size != 2 || len(firstPage.Items) != 2 {
+		t.Fatalf("page 1 = %#v", firstPage)
+	}
+
+	second := doGetAsUser(t, handlers["GET /instances"], "/?page=2&size=2", 1001)
+	if second.Code != http.StatusOK {
+		t.Fatalf("page 2 status = %d body=%s", second.Code, second.Body.String())
+	}
+	var secondPage workflowtypes.InstancePage
+	decodeResponseData(t, second, &secondPage)
+	if secondPage.Total != 3 || secondPage.Page != 2 || secondPage.Size != 2 || len(secondPage.Items) != 1 {
+		t.Fatalf("page 2 = %#v", secondPage)
+	}
+
+	seen := make(map[string]bool, firstPage.Total)
+	for _, item := range append(append([]workflowtypes.InstanceSummary(nil), firstPage.Items...), secondPage.Items...) {
+		if seen[item.ID] {
+			t.Fatalf("instance %q returned on more than one page", item.ID)
+		}
+		seen[item.ID] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("distinct instances across pages = %d, want 3", len(seen))
+	}
 }
 
 func registerTestRoutes(t *testing.T, registrar *Registrar) map[string]httpx.Handler {
@@ -1231,7 +1323,7 @@ func doRawWithToken(t *testing.T, handler httpx.Handler, params map[string]strin
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
-	return doRequest(t, handler, params, req, true)
+	return doRequest(t, handler, params, req, false)
 }
 
 func doRequest(t *testing.T, handler httpx.Handler, params map[string]string, req *http.Request, bindScope bool) *httptest.ResponseRecorder {
@@ -1249,7 +1341,7 @@ func doRequestWithScope(t *testing.T, handler httpx.Handler, params map[string]s
 		t.Fatalf("new context: %v", err)
 	}
 	if scopeID > 0 || strings.TrimSpace(scopeKind) != "" {
-		reqCtx := iamauth.BindActiveScopeContext(ctx.RequestContext(), scopeID, scopeKind)
+		reqCtx := auth.BindActiveScopeContext(ctx.RequestContext(), scopeID, scopeKind)
 		var principalErr error
 		reqCtx, principalErr = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: 1001, ActiveScopeID: scopeID})
 		if principalErr != nil {
@@ -1273,7 +1365,7 @@ func doRequestAsUser(t *testing.T, handler httpx.Handler, params map[string]stri
 	if err != nil {
 		t.Fatalf("new context: %v", err)
 	}
-	reqCtx := iamauth.BindActiveScopeContext(ctx.RequestContext(), 1, "tenant")
+	reqCtx := auth.BindActiveScopeContext(ctx.RequestContext(), 1, "tenant")
 	reqCtx, err = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: userID, ActiveScopeID: 1})
 	if err != nil {
 		t.Fatalf("with principal: %v", err)
@@ -1305,11 +1397,11 @@ func decodeResponseData(t *testing.T, rec *httptest.ResponseRecorder, target any
 
 func generateWorkflowToken(t *testing.T, permissions []string) string {
 	t.Helper()
-	token, err := iammw.GenerateToken(1, 1, "binding-v1", permissions, "workflow-test-secret")
+	raw, err := json.Marshal(permissions)
 	if err != nil {
-		t.Fatalf("GenerateToken: %v", err)
+		t.Fatalf("encode permissions: %v", err)
 	}
-	return token
+	return string(raw)
 }
 
 func workflowTestScopeContext(t *testing.T) context.Context {
@@ -1317,17 +1409,30 @@ func workflowTestScopeContext(t *testing.T) context.Context {
 	return workflowservice.WithScope(t.Context(), workflowservice.Scope{Kind: workflowservice.ScopeKindTenant, ID: 1})
 }
 
-type workflowTestAuthResolver struct{}
-
-func (workflowTestAuthResolver) ResolveAuthContext(_ context.Context, claims *iammw.JWTClaims) (*iammw.ResolvedAuthContext, error) {
-	if claims == nil || claims.ActiveScopeID <= 0 {
-		return &iammw.ResolvedAuthContext{}, nil
+func workflowTestAuthMiddleware() httpx.Middleware {
+	return func(ctx httpx.IContext, next func() error) error {
+		header := strings.TrimSpace(ctx.Header("Authorization"))
+		if !strings.HasPrefix(header, "Bearer ") {
+			return next()
+		}
+		rawPerms := strings.TrimPrefix(header, "Bearer ")
+		var perms []string
+		if err := json.Unmarshal([]byte(rawPerms), &perms); err != nil {
+			return err
+		}
+		baseCtx := auth.BindActiveScopeContext(ctx.RequestContext(), 1, string(auth.PermissionScopePlatform))
+		baseCtx, err := auth.WithPrincipal(baseCtx, auth.Principal{
+			SubjectID:        1,
+			ActiveScopeID:    1,
+			Permissions:      perms,
+			PermissionScopes: []string{string(auth.PermissionScopePlatform)},
+		})
+		if err != nil {
+			return err
+		}
+		ctx.SetContext(ctx.RequestContext().WithContext(baseCtx))
+		return next()
 	}
-	return &iammw.ResolvedAuthContext{
-		ActiveScopeID:   claims.ActiveScopeID,
-		ActiveScopeKind: "platform",
-		VisibleScopeIDs: []int64{claims.ActiveScopeID},
-	}, nil
 }
 
 func assertMessageCode(t *testing.T, rec *httptest.ResponseRecorder, code string) {

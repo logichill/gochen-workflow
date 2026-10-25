@@ -11,6 +11,7 @@ import (
 
 	workflowtypes "gochen-workflow/types"
 
+	appquery "gochen/app/query"
 	"gochen/errors"
 	runtime "gochen/process/workflow"
 )
@@ -30,16 +31,16 @@ type Store interface {
 	CountInstancesByDefinition(ctx context.Context, id string) (int, error)
 }
 
-type definitionListQuery struct {
-	page    int
-	size    int
-	offset  int
-	keyword string
-	status  workflowtypes.DefinitionStatus
+// DefinitionQueryStore 是可选的定义查询端口，外部存储适配器可下推筛选和分页。
+// 实现必须按当前 Scope 隔离数据，按更新时间倒序、ID 升序排序；
+// Stats/StatusCounts 只应用关键词过滤，Total 还应用状态过滤。
+type DefinitionQueryStore interface {
+	QueryDesigns(ctx context.Context, query workflowtypes.DefinitionQuery) (*workflowtypes.DefinitionListResponse, error)
 }
 
-type definitionQueryStore interface {
-	queryDesigns(ctx context.Context, query definitionListQuery) (*workflowtypes.DefinitionListResponse, error)
+// RunningInstanceStore 是可选的待办候选查询端口，仅返回当前 Scope 中运行的实例。
+type RunningInstanceStore interface {
+	ListRunningInstances(ctx context.Context) ([]*runtime.State, error)
 }
 
 // MemoryStore 是用于测试和本地开发的内存 workflow 存储。
@@ -80,6 +81,9 @@ type scopedInstanceKey struct {
 func currentManagedScope(ctx context.Context) (Scope, error) {
 	if ctx == nil {
 		return Scope{}, errors.NewCode(errors.InvalidInput, "workflow context is nil")
+	}
+	if strictScopeRequired(ctx) && !hasExplicitScope(ctx) {
+		return Scope{}, errors.NewCode(errors.InvalidInput, "workflow scope is required")
 	}
 	scope := ScopeFromContext(ctx)
 	if err := validateScope(scope); err != nil {
@@ -238,6 +242,23 @@ func (s *MemoryStore) ListInstances(ctx context.Context) ([]*runtime.State, erro
 	items := make([]*runtime.State, 0, len(s.states))
 	for key, st := range s.states {
 		if key.scopeKind != scope.Kind || key.scopeID != scope.ID {
+			continue
+		}
+		items = append(items, cloneState(st))
+	}
+	return items, nil
+}
+
+func (s *MemoryStore) ListRunningInstances(ctx context.Context) ([]*runtime.State, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	scope, err := currentManagedScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]*runtime.State, 0)
+	for key, st := range s.states {
+		if key.scopeKind != scope.Kind || key.scopeID != scope.ID || st.Status != runtime.InstanceStatusRunning {
 			continue
 		}
 		items = append(items, cloneState(st))
@@ -936,7 +957,10 @@ func (s *SQLiteStore) primaryKeyMatches(ctx context.Context, table string, want 
 	if err != nil {
 		return false, errors.Wrap(err, errors.Database, "inspect workflow table").WithContext("table", table)
 	}
-	defer rows.Close()
+	defer func() {
+		// 完整遍历的关闭错误由 Err 返回；提前退出时保留原始读取错误。
+		_ = rows.Close()
+	}()
 	// pkByIndex 收集完整主键（pkIndex 从 1 开始），不假设主键列数，
 	// 避免实际主键列数多于 want 时被静默截断导致误判。
 	pkByIndex := make(map[int]string)
@@ -975,6 +999,7 @@ func (s *SQLiteStore) ensureScopeIndexes(ctx context.Context) error {
 	scopeIndexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_workflow_definitions_scope_updated ON workflow_definitions(managed_scope_kind, managed_scope_id, updated_at DESC, id ASC)`,
 		`CREATE INDEX IF NOT EXISTS idx_workflow_instances_definition_scope ON workflow_instances(managed_scope_kind, managed_scope_id, definition_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_workflow_instances_scope_status_updated ON workflow_instances(managed_scope_kind, managed_scope_id, status, updated_at DESC, id ASC)`,
 		`CREATE INDEX IF NOT EXISTS idx_workflow_instances_scope_updated ON workflow_instances(managed_scope_kind, managed_scope_id, updated_at DESC, id ASC)`,
 	}
 	for _, statement := range scopeIndexes {
@@ -994,7 +1019,10 @@ func (s *SQLiteStore) ListDesigns(ctx context.Context) ([]*workflowtypes.Designe
 	if err != nil {
 		return nil, errors.Wrap(err, errors.Database, "list workflow definitions")
 	}
-	defer rows.Close()
+	defer func() {
+		// 完整遍历的关闭错误由 Err 返回；提前退出时保留原始读取错误。
+		_ = rows.Close()
+	}()
 	var items []*workflowtypes.DesignerDefinition
 	for rows.Next() {
 		design, err := scanDesignRows(rows)
@@ -1009,16 +1037,25 @@ func (s *SQLiteStore) ListDesigns(ctx context.Context) ([]*workflowtypes.Designe
 	return items, nil
 }
 
-func (s *SQLiteStore) queryDesigns(ctx context.Context, query definitionListQuery) (*workflowtypes.DefinitionListResponse, error) {
+func (s *SQLiteStore) QueryDesigns(ctx context.Context, query workflowtypes.DefinitionQuery) (*workflowtypes.DefinitionListResponse, error) {
 	scope, err := currentManagedScope(ctx)
 	if err != nil {
 		return nil, err
 	}
+	query.Page, query.Size, err = normalizeDefinitionPage(query.Page, query.Size)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDefinitionStatus(query.Status); err != nil {
+		return nil, err
+	}
+	query.Keyword = strings.ToLower(strings.TrimSpace(query.Keyword))
+
 	where := "managed_scope_kind = ? AND managed_scope_id = ?"
 	baseArgs := []any{scope.Kind, scope.ID}
-	if query.keyword != "" {
+	if query.Keyword != "" {
 		where += " AND instr(lower(id || ' ' || name || ' ' || COALESCE(json_extract(graph_json, '$.description'), '')), ?) > 0"
-		baseArgs = append(baseArgs, query.keyword)
+		baseArgs = append(baseArgs, query.Keyword)
 	}
 
 	stats := workflowtypes.DefinitionStats{}
@@ -1054,15 +1091,15 @@ func (s *SQLiteStore) queryDesigns(ctx context.Context, query definitionListQuer
 	filteredWhere := where
 	filteredArgs := append([]any(nil), baseArgs...)
 	total := stats.Total
-	if query.status != "" {
+	if query.Status != "" {
 		filteredWhere += " AND status = ?"
-		filteredArgs = append(filteredArgs, string(query.status))
+		filteredArgs = append(filteredArgs, string(query.Status))
 		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM workflow_definitions WHERE "+filteredWhere, filteredArgs...).Scan(&total); err != nil {
 			return nil, errors.Wrap(err, errors.Database, "count filtered workflow definitions")
 		}
 	}
 
-	pageArgs := append(append([]any(nil), filteredArgs...), query.size, query.offset)
+	pageArgs := append(append([]any(nil), filteredArgs...), query.Size, (&appquery.PaginationOptions{Page: query.Page, Size: query.Size}).Offset())
 	pageRows, err := s.db.QueryContext(ctx,
 		"SELECT graph_json, runtime_definition_json FROM workflow_definitions WHERE "+filteredWhere+` ORDER BY
 			substr(updated_at, 1, 19) DESC,
@@ -1080,8 +1117,11 @@ func (s *SQLiteStore) queryDesigns(ctx context.Context, query definitionListQuer
 	if err != nil {
 		return nil, errors.Wrap(err, errors.Database, "query workflow definition page")
 	}
-	defer pageRows.Close()
-	items := make([]*workflowtypes.DesignerDefinition, 0, query.size)
+	defer func() {
+		// 完整遍历的关闭错误由 Err 返回；提前退出时保留原始读取错误。
+		_ = pageRows.Close()
+	}()
+	items := make([]*workflowtypes.DesignerDefinition, 0, query.Size)
 	for pageRows.Next() {
 		design, err := scanDesignRows(pageRows)
 		if err != nil {
@@ -1095,8 +1135,8 @@ func (s *SQLiteStore) queryDesigns(ctx context.Context, query definitionListQuer
 	return &workflowtypes.DefinitionListResponse{
 		Items:        items,
 		Total:        total,
-		Page:         query.page,
-		Size:         query.size,
+		Page:         query.Page,
+		Size:         query.Size,
 		Stats:        stats,
 		StatusCounts: stats,
 	}, nil
@@ -1275,20 +1315,28 @@ func (s *SQLiteStore) ListInstances(ctx context.Context) ([]*runtime.State, erro
 	return s.listInstancesWhere(ctx, "")
 }
 
+func (s *SQLiteStore) ListRunningInstances(ctx context.Context) ([]*runtime.State, error) {
+	return s.listInstancesWhere(ctx, " AND status = ?", string(runtime.InstanceStatusRunning))
+}
+
 func (s *SQLiteStore) ListStartedInstances(ctx context.Context) ([]*runtime.State, error) {
 	return s.listInstancesWhere(ctx, " AND started_at IS NOT NULL")
 }
 
-func (s *SQLiteStore) listInstancesWhere(ctx context.Context, extraWhere string) ([]*runtime.State, error) {
+func (s *SQLiteStore) listInstancesWhere(ctx context.Context, extraWhere string, extraArgs ...any) ([]*runtime.State, error) {
 	scope, err := currentManagedScope(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT state_json, version FROM workflow_instances WHERE managed_scope_kind = ? AND managed_scope_id = ?`+extraWhere+` ORDER BY updated_at DESC, id ASC`, scope.Kind, scope.ID)
+	args := append([]any{scope.Kind, scope.ID}, extraArgs...)
+	rows, err := s.db.QueryContext(ctx, `SELECT state_json, version FROM workflow_instances WHERE managed_scope_kind = ? AND managed_scope_id = ?`+extraWhere+` ORDER BY updated_at DESC, id ASC`, args...)
 	if err != nil {
 		return nil, errors.Wrap(err, errors.Database, "list workflow instances")
 	}
-	defer rows.Close()
+	defer func() {
+		// 完整遍历的关闭错误由 Err 返回；提前退出时保留原始读取错误。
+		_ = rows.Close()
+	}()
 	var items []*runtime.State
 	for rows.Next() {
 		state, err := scanStateRows(rows)

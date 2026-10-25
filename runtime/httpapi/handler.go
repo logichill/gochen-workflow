@@ -7,14 +7,11 @@ import (
 	"strings"
 	"time"
 
-	iamauth "gochen-iam/auth"
-	iammw "gochen-iam/middleware"
 	"gochen-runtime/api/rest"
 	auth "gochen-runtime/host/authz"
 	workflowpermissions "gochen-workflow/permissions"
 	workflowservice "gochen-workflow/service"
 	workflowtypes "gochen-workflow/types"
-	"gochen/app/query"
 	"gochen/errors"
 	"gochen/httpx"
 	runtime "gochen/process/workflow"
@@ -41,22 +38,22 @@ func (r *Registrar) RegisterRoutes(group httpx.IRouteGroup) error {
 		return errors.NewCode(errors.InvalidInput, "workflow route group is nil")
 	}
 
-	readDefinitions := group.Group("/definitions").Use(iammw.PermissionMiddleware(workflowpermissions.WorkflowRead))
+	readDefinitions := group.Group("/definitions").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRead))
 	readDefinitions.GET("", r.listDefinitions)
 	readDefinitions.GET("/:id", r.getDefinition)
 
-	writeDefinitions := group.Group("/definitions").Use(iammw.PermissionMiddleware(workflowpermissions.WorkflowDesign))
+	writeDefinitions := group.Group("/definitions").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowDesign))
 	writeDefinitions.POST("", r.createDefinition)
 	writeDefinitions.PUT("/:id", r.updateDefinition)
 	writeDefinitions.DELETE("/:id", r.deleteDefinition)
 	writeDefinitions.POST("/:id/publish", r.publishDefinition)
 	writeDefinitions.POST("/:id/archive", r.archiveDefinition)
 
-	readInstances := group.Group("/instances").Use(iammw.PermissionMiddleware(workflowpermissions.WorkflowRead))
+	readInstances := group.Group("/instances").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRead))
 	readInstances.GET("", r.listInstances)
 	readInstances.GET("/:id", r.getInstance)
 
-	readWorkItems := group.Group("").Use(iammw.PermissionMiddleware(workflowpermissions.WorkflowRead))
+	readWorkItems := group.Group("").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRead))
 	readWorkItems.GET("/todos", r.listTodos)
 	readWorkItems.GET("/done", r.listDone)
 	readWorkItems.GET("/started", r.listStarted)
@@ -64,7 +61,7 @@ func (r *Registrar) RegisterRoutes(group httpx.IRouteGroup) error {
 	readWorkItems.GET("/my/done", r.listMyDone)
 	readWorkItems.GET("/my/started", r.listMyStarted)
 
-	runInstances := group.Group("/instances").Use(iammw.PermissionMiddleware(workflowpermissions.WorkflowRun))
+	runInstances := group.Group("/instances").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRun))
 	runInstances.POST("", r.createInstance)
 	runInstances.POST("/:id/start", r.startInstance)
 	runInstances.POST("/:id/nodes/:node_id/advance", r.advanceNode)
@@ -330,6 +327,7 @@ func (r *Registrar) completeNodeWithAction(ctx httpx.IContext, action string) er
 	}
 	if selected {
 		input.NextNodeID = nextNodeID
+		input.NextNodeIDs = []string{nextNodeID}
 	}
 	if !hasBody || !selected {
 		var state *runtime.State
@@ -576,7 +574,23 @@ func (r *Registrar) listMyStarted(ctx httpx.IContext) error {
 
 func selectedNextNodeID(nextNodeID *string, nextNodeIDs *[]string) (string, bool, error) {
 	if nextNodeID != nil && nextNodeIDs != nil {
-		return "", false, errors.NewCode(errors.InvalidInput, "workflow selected next node is ambiguous")
+		single := strings.TrimSpace(*nextNodeID)
+		selectedNextNodeIDs := *nextNodeIDs
+		if len(selectedNextNodeIDs) == 0 {
+			return "", false, errors.NewCode(errors.InvalidInput, "workflow selected next nodes cannot be empty")
+		}
+		if len(selectedNextNodeIDs) > 1 {
+			return "", false, errors.NewCode(errors.InvalidInput, "workflow selected next nodes must contain at most one node").
+				WithContext("selected_count", len(selectedNextNodeIDs))
+		}
+		fromList := strings.TrimSpace(selectedNextNodeIDs[0])
+		if single == "" || fromList == "" {
+			return "", false, errors.NewCode(errors.InvalidInput, "workflow selected next node is empty")
+		}
+		if single != fromList {
+			return "", false, errors.NewCode(errors.InvalidInput, "workflow selected next node is ambiguous")
+		}
+		return single, true, nil
 	}
 	if nextNodeID != nil {
 		selected := strings.TrimSpace(*nextNodeID)
@@ -660,8 +674,8 @@ func instanceQuery(ctx httpx.IContext) (workflowtypes.InstanceQuery, error) {
 
 func (r *Registrar) serviceContext(ctx httpx.IContext) (context.Context, error) {
 	reqCtx := ctx.RequestContext()
-	scopeID := iamauth.ActiveScopeIDFromContext(reqCtx)
-	scopeKind := iamauth.ActiveScopeKindFromContext(reqCtx)
+	scopeID := auth.ActiveScopeIDFromContext(reqCtx)
+	scopeKind := auth.ActiveScopeKindFromContext(reqCtx)
 	if scopeID <= 0 || strings.TrimSpace(scopeKind) == "" {
 		return nil, errors.NewCode(errors.Unauthorized, "workflow active scope is required")
 	}
@@ -670,7 +684,7 @@ func (r *Registrar) serviceContext(ctx httpx.IContext) (context.Context, error) 
 		return nil, errors.NewCode(errors.Forbidden, "workflow active scope is unsupported").
 			WithContext("scope_kind", scopeKind)
 	}
-	return workflowservice.WithScope(reqCtx, workflowservice.Scope{Kind: scopeKind, ID: scopeID}), nil
+	return workflowservice.WithStrictScope(workflowservice.WithScope(reqCtx, workflowservice.Scope{Kind: scopeKind, ID: scopeID})), nil
 }
 
 func requiredParam(ctx httpx.IContext, key string) string {
@@ -683,22 +697,4 @@ func requiredParamValue(ctx httpx.IContext, key string, message string) (string,
 		return "", errors.NewCode(errors.InvalidInput, message).WithContext("param", key)
 	}
 	return value, nil
-}
-
-func paginateInstanceSummaries(items []workflowtypes.InstanceSummary, page int, size int) *workflowtypes.InstancePage {
-	total := len(items)
-	start := (&query.PaginationOptions{Page: page, Size: size}).Offset()
-	if start >= total {
-		return &workflowtypes.InstancePage{Items: []workflowtypes.InstanceSummary{}, Total: total, Page: page, Size: size}
-	}
-	end := start + size
-	if end > total {
-		end = total
-	}
-	return &workflowtypes.InstancePage{
-		Items: append([]workflowtypes.InstanceSummary(nil), items[start:end]...),
-		Total: total,
-		Page:  page,
-		Size:  size,
-	}
 }

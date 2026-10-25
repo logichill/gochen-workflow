@@ -2,8 +2,10 @@ package workflowservice
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
+	"gochen/contextx"
 	"gochen/errors"
 )
 
@@ -39,8 +41,14 @@ func hasExplicitScope(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
-	_, ok := ctx.Value(scopeContextKey{}).(Scope)
-	return ok
+	if _, ok := ctx.Value(scopeContextKey{}).(Scope); ok {
+		return true
+	}
+	// 只要上下文携带租户指示（即便值不可解析为正整数）就算显式租户意图：
+	// 与 ScopeFromContext 的租户分支同口径，统一由 validateScope 拒绝 ID 无效的租户作用域，
+	// 避免同一输入在两个入口产生 "scope is required" 与 "tenant scope id is required" 两种语义。
+	_, hasTenant := parseContextTenantID(ctx)
+	return hasTenant
 }
 
 func strictScopeRequired(ctx context.Context) bool {
@@ -53,22 +61,43 @@ func strictScopeRequired(ctx context.Context) bool {
 
 func ScopeFromContext(ctx context.Context) Scope {
 	if ctx == nil {
-		return Scope{Kind: ScopeKindPlatform}
+		return Scope{}
+	}
+	if strictScopeRequired(ctx) && !hasExplicitScope(ctx) {
+		return Scope{}
 	}
 	if scope, ok := ctx.Value(scopeContextKey{}).(Scope); ok {
 		return normalizeScope(scope)
 	}
+	if tenantID, hasTenant := parseContextTenantID(ctx); hasTenant {
+		return Scope{Kind: ScopeKindTenant, ID: tenantID}
+	}
 	return Scope{Kind: ScopeKindPlatform}
+}
+
+func parseContextTenantID(ctx context.Context) (int64, bool) {
+	raw := strings.TrimSpace(contextx.TenantID(ctx))
+	if raw == "" {
+		return 0, false
+	}
+	if tenantID, err := strconv.ParseInt(raw, 10, 64); err == nil && tenantID > 0 {
+		return tenantID, true
+	}
+	return 0, true
 }
 
 func validateScope(scope Scope) error {
 	scope = normalizeScope(scope)
 	switch scope.Kind {
-	case ScopeKindPlatform, ScopeKindTenant:
-		if scope.Kind == ScopeKindTenant && scope.ID <= 0 {
+	case ScopeKindPlatform:
+		return nil
+	case ScopeKindTenant:
+		if scope.ID <= 0 {
 			return errors.NewCode(errors.InvalidInput, "workflow tenant scope id is required")
 		}
 		return nil
+	case "":
+		return errors.NewCode(errors.InvalidInput, "workflow scope is required")
 	default:
 		return errors.NewCode(errors.InvalidInput, "workflow scope kind is unsupported").
 			WithContext("scope_kind", scope.Kind)
@@ -77,12 +106,6 @@ func validateScope(scope Scope) error {
 
 func normalizeScope(scope Scope) Scope {
 	kind := strings.ToLower(strings.TrimSpace(scope.Kind))
-	switch kind {
-	case "", ScopeKindPlatform:
-		kind = ScopeKindPlatform
-	case ScopeKindTenant:
-		kind = ScopeKindTenant
-	}
 	if scope.ID < 0 {
 		scope.ID = 0
 	}

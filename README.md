@@ -34,8 +34,8 @@ go run ./cmd/gochen-workflow
 ```
 
 `GOCHEN_WORKFLOW_SQLITE_DSN` 为空时，默认写入 `file:gochen-workflow.db`。
-独立服务默认挂载 `gochen-iam` 鉴权中间件；除 health/ping 等跳过路径外，API 请求需要携带 `Authorization: Bearer <token>`。
-本地联调时应保证 token 由相同 `AUTH_SECRET` 签发，并包含 `active_scope_id` 与对应 API 权限；独立服务会将 `active_scope_id` 作为当前租户级 scope。宿主模块接入时，HTTP 层会把 IAM active scope 映射为 workflow service scope，service/store 只按轻量 scope 上下文做数据隔离。
+独立服务内置 HS256 JWT 鉴权中间件；除 health/ping 等跳过路径外，API 请求需要携带 `Authorization: Bearer <token>`。
+本地联调时应保证 token 由相同 `AUTH_SECRET` 签发，并包含 `active_scope_id` 与对应 API 权限；独立服务会将 `active_scope_id` 作为当前租户级 scope。宿主模块接入时，HTTP 层会把 `gochen-runtime/host/authz` 的 active scope 映射为 workflow service scope，service/store 只按轻量 scope 上下文做数据隔离。
 
 旧版本未启用 scope 的 SQLite 数据会迁移到 `platform/0`，不会被任何 HTTP tenant 自动认领。确认数据归属后，使用 `GOCHEN_WORKFLOW_LEGACY_SCOPE_ID=<positive-id>` 启动一次服务，将这些记录原子迁移到当前 `GOCHEN_WORKFLOW_SCOPE_KIND`（未设置时为 `tenant`）和指定 ID；目标 scope 已存在同 ID 记录时迁移会失败并回滚。
 
@@ -62,7 +62,7 @@ err := app.Run(ctx)
 
 Host 未配置模块前缀时，会根据模块 ID 自动挂载到 `/workflow`。
 
-模块依赖 `service.Store`、`ident.IGenerator[string]` 与 `clock.IClock`，由宿主通过 GoChen DI 注入。当前仓库的 [`go.mod`](/home/alex/data/priv/project/gochen-workflow/go.mod) 通过 `replace` 指向相邻工作区 `../gochen` 与 `../gochen-iam`；若脱离该 mono-workspace 单独使用，需要改成可解析的模块来源。
+模块依赖 `service.Store`、`ident.IGenerator[string]` 与 `clock.IClock`，由宿主通过 GoChen DI 注入。当前仓库的 [`go.mod`](go.mod) 通过 `replace` 指向相邻工作区 `../gochen` 与 `../gochen-runtime`；若脱离该 mono-workspace 单独使用，需要改成可解析的模块来源。
 
 ## API
 
