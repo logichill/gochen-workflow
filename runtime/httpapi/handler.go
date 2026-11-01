@@ -3,7 +3,6 @@ package httpapi
 import (
 	"bytes"
 	"context"
-	"strconv"
 	"strings"
 	"time"
 
@@ -216,10 +215,10 @@ func (r *Registrar) createInstance(ctx httpx.IContext) error {
 		return err
 	}
 	principal, err := auth.RequirePrincipal(serviceCtx)
-	if err != nil || principal.SubjectID <= 0 {
+	if err != nil || principal.SubjectID == "" {
 		return errors.NewCode(errors.Unauthorized, "workflow principal is required")
 	}
-	input.InitiatorID = strconv.FormatInt(principal.SubjectID, 10)
+	input.InitiatorID = principal.SubjectID
 	input.InitiatorName = ""
 	state, err := r.service.CreateInstanceWithOptions(serviceCtx, input)
 	if err != nil {

@@ -508,7 +508,7 @@ func injectClaimsRequestContext(
 	baseCtx := context.Context(reqCtx)
 	var err error
 	if claims.UserID > 0 {
-		baseCtx, err = contextx.WithUserID(baseCtx, claims.UserID)
+		baseCtx, err = contextx.WithUserID(baseCtx, strconv.FormatInt(claims.UserID, 10))
 		if err != nil {
 			return nil, err
 		}
@@ -533,7 +533,7 @@ func injectClaimsRequestContext(
 		}
 	}
 	principal := auth.Principal{
-		SubjectID:     claims.UserID,
+		SubjectID:     strconv.FormatInt(claims.UserID, 10),
 		Permissions:   claims.Permissions,
 		ActiveScopeID: claims.ActiveScopeID,
 	}
@@ -578,4 +578,3 @@ func standaloneScopeKind() (string, error) {
 			WithContext("scope_kind", os.Getenv("GOCHEN_WORKFLOW_SCOPE_KIND"))
 	}
 }
-

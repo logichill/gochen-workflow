@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"gochen/gen/uuid"
 	"gochen/errors"
+	"gochen/gen/uuid"
 
 	workflowpermissions "gochen-workflow/permissions"
 
@@ -115,7 +115,7 @@ func TestStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 	if !ok {
 		t.Fatal("expected principal in request context")
 	}
-	if principal.SubjectID != 7 || principal.ActiveScopeID != 42 {
+	if principal.SubjectID != "7" || principal.ActiveScopeID != 42 {
 		t.Fatalf("unexpected principal: %+v", principal)
 	}
 	if got := auth.ActiveScopeKindFromContext(ctx.RequestContext()); got != string(auth.PermissionScopeTenant) {
@@ -180,7 +180,6 @@ func runMiddlewareChain(ctx httpx.IContext, middlewares []httpx.Middleware, fina
 	}
 	return next()
 }
-
 
 // generateToken 仅供测试签发 access token；生产路径只做校验，不携带签发能力。
 func generateToken(userID, activeScopeID int64, bindingVersion string, permissions []string, secretKey string) (string, error) {

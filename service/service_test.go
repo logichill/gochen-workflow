@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2328,7 +2329,7 @@ func principalContext(t *testing.T, userID int64) context.Context {
 
 func principalContextWithRoles(t *testing.T, userID int64, roles []string) context.Context {
 	t.Helper()
-	ctx, err := auth.WithPrincipal(context.Background(), auth.Principal{SubjectID: userID, ActiveScopeID: 1, Roles: roles})
+	ctx, err := auth.WithPrincipal(context.Background(), auth.Principal{SubjectID: strconv.FormatInt(userID, 10), ActiveScopeID: 1, Roles: roles})
 	if err != nil {
 		t.Fatalf("with principal: %v", err)
 	}
@@ -2903,7 +2904,7 @@ func TestServiceStoreFailureInjection(t *testing.T) {
 	}
 	svc = newTestService(failStore)
 	adminCtx, err := auth.WithPrincipal(context.Background(), auth.Principal{
-		SubjectID:     1,
+		SubjectID:     "1",
 		ActiveScopeID: 1,
 		Roles:         []string{"admin"},
 	})

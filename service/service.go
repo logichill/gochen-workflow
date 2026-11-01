@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1541,10 +1540,10 @@ func isNodeCompletionAction(action string) bool {
 
 func currentPrincipalID(ctx context.Context) string {
 	principal, ok := auth.PrincipalFromContext(ctx)
-	if !ok || principal.SubjectID <= 0 {
+	if !ok {
 		return ""
 	}
-	return strconv.FormatInt(principal.SubjectID, 10)
+	return principal.SubjectID
 }
 
 func currentPrincipalRoles(ctx context.Context) []string {
@@ -1560,10 +1559,10 @@ func requireActor(ctx context.Context) (string, []string, error) {
 	if err != nil {
 		return "", nil, errors.NewCode(errors.Unauthorized, "workflow principal is required")
 	}
-	if principal.SubjectID <= 0 {
+	if principal.SubjectID == "" {
 		return "", nil, errors.NewCode(errors.Unauthorized, "workflow principal is required")
 	}
-	return strconv.FormatInt(principal.SubjectID, 10), normalizeStringSlice(principal.Roles), nil
+	return principal.SubjectID, normalizeStringSlice(principal.Roles), nil
 }
 
 func actorCanTakeAssignment(assignment workflowtypes.TaskAssignment, actorID string, actorRoles []string) bool {

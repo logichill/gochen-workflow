@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1343,7 +1344,7 @@ func doRequestWithScope(t *testing.T, handler httpx.Handler, params map[string]s
 	if scopeID > 0 || strings.TrimSpace(scopeKind) != "" {
 		reqCtx := auth.BindActiveScopeContext(ctx.RequestContext(), scopeID, scopeKind)
 		var principalErr error
-		reqCtx, principalErr = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: 1001, ActiveScopeID: scopeID})
+		reqCtx, principalErr = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: "1001", ActiveScopeID: scopeID})
 		if principalErr != nil {
 			t.Fatalf("with principal: %v", principalErr)
 		}
@@ -1366,7 +1367,7 @@ func doRequestAsUser(t *testing.T, handler httpx.Handler, params map[string]stri
 		t.Fatalf("new context: %v", err)
 	}
 	reqCtx := auth.BindActiveScopeContext(ctx.RequestContext(), 1, "tenant")
-	reqCtx, err = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: userID, ActiveScopeID: 1})
+	reqCtx, err = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: strconv.FormatInt(userID, 10), ActiveScopeID: 1})
 	if err != nil {
 		t.Fatalf("with principal: %v", err)
 	}
@@ -1422,7 +1423,7 @@ func workflowTestAuthMiddleware() httpx.Middleware {
 		}
 		baseCtx := auth.BindActiveScopeContext(ctx.RequestContext(), 1, string(auth.PermissionScopePlatform))
 		baseCtx, err := auth.WithPrincipal(baseCtx, auth.Principal{
-			SubjectID:        1,
+			SubjectID:        "1",
 			ActiveScopeID:    1,
 			Permissions:      perms,
 			PermissionScopes: []string{string(auth.PermissionScopePlatform)},
