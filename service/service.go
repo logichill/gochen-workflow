@@ -49,7 +49,7 @@ func NewService(store Store, idGenerator gen.IGenerator[string], clk clock.ICloc
 
 // ListDefinitions 返回按更新时间倒序排列的设计态定义列表。
 func (s *Service) ListDefinitions(ctx context.Context) ([]*workflowtypes.DesignerDefinition, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "read"); err != nil {
 		return nil, err
 	}
 	items, err := s.store.ListDesigns(ctx)
@@ -83,7 +83,7 @@ func (s *Service) BuildDefinitionListResponse(ctx context.Context) (*workflowtyp
 
 // BuildDefinitionListResponseWithQuery 生成经过筛选和分页的定义列表及全量状态统计。
 func (s *Service) BuildDefinitionListResponseWithQuery(ctx context.Context, query workflowtypes.DefinitionQuery) (*workflowtypes.DefinitionListResponse, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "read"); err != nil {
 		return nil, err
 	}
 	page, size, err := normalizeDefinitionPage(query.Page, query.Size)
@@ -221,7 +221,7 @@ func countDefinitionStats(items []*workflowtypes.DesignerDefinition) workflowtyp
 //
 // 说明：底层的 Store 契约支持按指定版本读取（GetDefinition(ctx, id, version)）；
 // 应用服务层与面向前端的 HTTP 接口默认管理并操作最新生效的设计态定义。
-func (s *Service) GetDefinition(ctx context.Context, id string) (*workflowtypes.DesignerDefinition, error) {
+func (s *Service) getDefinition(ctx context.Context, id string) (*workflowtypes.DesignerDefinition, error) {
 	if err := s.validateReady(ctx); err != nil {
 		return nil, err
 	}
@@ -241,7 +241,7 @@ func (s *Service) GetDefinition(ctx context.Context, id string) (*workflowtypes.
 
 // SaveDefinition 创建或更新草稿定义；已发布/归档定义保持不可变。
 func (s *Service) SaveDefinition(ctx context.Context, input *workflowtypes.DesignerDefinition) (*workflowtypes.DesignerDefinition, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "design"); err != nil {
 		return nil, err
 	}
 	if input == nil {
@@ -302,7 +302,7 @@ func (s *Service) SaveDefinition(ctx context.Context, input *workflowtypes.Desig
 
 // DeleteDefinition 只允许删除未被实例引用的草稿定义。
 func (s *Service) DeleteDefinition(ctx context.Context, id string) error {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "design"); err != nil {
 		return err
 	}
 	id = strings.TrimSpace(id)
@@ -338,14 +338,14 @@ func (s *Service) DeleteDefinition(ctx context.Context, id string) error {
 
 // PublishDefinition 将当前草稿固化为可运行定义；发布后不再允许原地编辑图结构。
 func (s *Service) PublishDefinition(ctx context.Context, id string) (*workflowtypes.DesignerDefinition, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "design"); err != nil {
 		return nil, err
 	}
 	id = strings.TrimSpace(id)
 	s.definitionMu.Lock()
 	defer s.definitionMu.Unlock()
 
-	design, err := s.GetDefinition(ctx, id)
+	design, err := s.getDefinition(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -363,14 +363,14 @@ func (s *Service) PublishDefinition(ctx context.Context, id string) (*workflowty
 
 // ArchiveDefinition 将已发布定义标记为归档；运行时快照保留给既有实例继续推进。
 func (s *Service) ArchiveDefinition(ctx context.Context, id string) (*workflowtypes.DesignerDefinition, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "design"); err != nil {
 		return nil, err
 	}
 	id = strings.TrimSpace(id)
 	s.definitionMu.Lock()
 	defer s.definitionMu.Unlock()
 
-	design, err := s.GetDefinition(ctx, id)
+	design, err := s.getDefinition(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +417,7 @@ func (s *Service) CreateInstance(ctx context.Context, instanceID runtime.ID, def
 }
 
 func (s *Service) CreateInstanceWithOptions(ctx context.Context, input workflowtypes.CreateInstanceInput) (*runtime.State, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "run"); err != nil {
 		return nil, err
 	}
 	instanceID := runtime.ID(strings.TrimSpace(input.ID))
@@ -443,6 +443,9 @@ func (s *Service) CreateInstanceWithOptions(ctx context.Context, input workflowt
 	if meta.InitiatorID == "" {
 		meta.InitiatorID = currentPrincipalID(ctx)
 	}
+	if principal, ok := auth.PrincipalFromContext(ctx); ok && !principal.IsSystem && meta.InitiatorID != principal.SubjectID {
+		return nil, errors.NewCode(errors.Forbidden, "workflow initiator differs from authenticated principal")
+	}
 	if meta.InitiatorID == "" {
 		meta.InitiatorID = systemInitiatorID
 	}
@@ -450,7 +453,7 @@ func (s *Service) CreateInstanceWithOptions(ctx context.Context, input workflowt
 		meta.TaskAssignments["*"] = assignment
 	}
 
-	design, err := s.GetDefinition(ctx, definitionID)
+	design, err := s.getDefinition(ctx, definitionID)
 	if err != nil {
 		return nil, err
 	}
@@ -478,7 +481,7 @@ func (s *Service) CreateInstanceWithOptions(ctx context.Context, input workflowt
 }
 
 func (s *Service) StartInstance(ctx context.Context, id runtime.ID) (*runtime.State, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "run"); err != nil {
 		return nil, err
 	}
 	id = runtime.ID(strings.TrimSpace(string(id)))
@@ -491,7 +494,7 @@ func (s *Service) StartInstance(ctx context.Context, id runtime.ID) (*runtime.St
 	}); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func (s *Service) AdvanceNode(ctx context.Context, id runtime.ID, nodeID string) (*runtime.State, error) {
@@ -512,7 +515,7 @@ func (s *Service) completeNodeWithAction(ctx context.Context, id runtime.ID, nod
 	} else if selected {
 		return s.completeNodeToWithAction(ctx, id, nodeID, nextNodeID, input, action)
 	}
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "run"); err != nil {
 		return nil, err
 	}
 	id = runtime.ID(strings.TrimSpace(string(id)))
@@ -528,7 +531,7 @@ func (s *Service) completeNodeWithAction(ctx context.Context, id runtime.ID, nod
 	}); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func selectedNextNodeFromInput(input workflowtypes.AdvanceNodeInput) (string, bool, error) {
@@ -566,7 +569,7 @@ func (s *Service) CompleteNodeTo(ctx context.Context, id runtime.ID, nodeID stri
 }
 
 func (s *Service) completeNodeToWithAction(ctx context.Context, id runtime.ID, nodeID string, nextNodeID string, input workflowtypes.AdvanceNodeInput, action string) (*runtime.State, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "run"); err != nil {
 		return nil, err
 	}
 	id = runtime.ID(strings.TrimSpace(string(id)))
@@ -591,11 +594,11 @@ func (s *Service) completeNodeToWithAction(ctx context.Context, id runtime.ID, n
 	}); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func (s *Service) RejectNode(ctx context.Context, id runtime.ID, nodeID string, input workflowtypes.RejectNodeInput) (*runtime.State, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "run"); err != nil {
 		return nil, err
 	}
 	id = runtime.ID(strings.TrimSpace(string(id)))
@@ -615,10 +618,10 @@ func (s *Service) RejectNode(ctx context.Context, id runtime.ID, nodeID string, 
 	}); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
-func (s *Service) GetInstance(ctx context.Context, id runtime.ID) (*runtime.State, error) {
+func (s *Service) getInstance(ctx context.Context, id runtime.ID) (*runtime.State, error) {
 	if err := s.validateReady(ctx); err != nil {
 		return nil, err
 	}
@@ -653,7 +656,7 @@ func (s *Service) ListStartedInstances(ctx context.Context, query workflowtypes.
 }
 
 func (s *Service) listInstances(ctx context.Context, query workflowtypes.InstanceQuery, startedOnly bool) (*workflowtypes.InstancePage, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "read"); err != nil {
 		return nil, err
 	}
 	page, size, err := normalizeWorkItemPage(query.Page, query.Size)
@@ -711,7 +714,7 @@ func (s *Service) ListTodoItemsByQuery(ctx context.Context, query workflowtypes.
 }
 
 func (s *Service) listTodoItemsByQuery(ctx context.Context, query workflowtypes.WorkItemQuery, actorRoles []string) (*workflowtypes.WorkItemPage, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "read"); err != nil {
 		return nil, err
 	}
 	page, size, err := normalizeWorkItemPage(query.Page, query.Size)
@@ -767,7 +770,7 @@ func (s *Service) ListMyDoneItems(ctx context.Context, query workflowtypes.WorkI
 }
 
 func (s *Service) ListDoneItemsByQuery(ctx context.Context, query workflowtypes.WorkItemQuery) (*workflowtypes.WorkItemPage, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "read"); err != nil {
 		return nil, err
 	}
 	page, size, err := normalizeWorkItemPage(query.Page, query.Size)
@@ -882,7 +885,7 @@ func (s *Service) ClaimTask(ctx context.Context, id runtime.ID, nodeID string, i
 	if err := s.store.SaveIfVersion(ctx, st, st.Version); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func (s *Service) UnclaimTask(ctx context.Context, id runtime.ID, nodeID string, input workflowtypes.TaskActionInput) (*runtime.State, error) {
@@ -917,7 +920,7 @@ func (s *Service) UnclaimTask(ctx context.Context, id runtime.ID, nodeID string,
 	if err := s.store.SaveIfVersion(ctx, st, st.Version); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func (s *Service) TransferTask(ctx context.Context, id runtime.ID, nodeID string, input workflowtypes.TaskActionInput) (*runtime.State, error) {
@@ -962,7 +965,7 @@ func (s *Service) TransferTask(ctx context.Context, id runtime.ID, nodeID string
 	if err := s.store.SaveIfVersion(ctx, st, st.Version); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func (s *Service) DelegateTask(ctx context.Context, id runtime.ID, nodeID string, input workflowtypes.TaskActionInput) (*runtime.State, error) {
@@ -1009,7 +1012,7 @@ func (s *Service) DelegateTask(ctx context.Context, id runtime.ID, nodeID string
 	if err := s.store.SaveIfVersion(ctx, st, st.Version); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func (s *Service) RemindTask(ctx context.Context, id runtime.ID, nodeID string, input workflowtypes.TaskActionInput) (*runtime.State, error) {
@@ -1031,11 +1034,11 @@ func (s *Service) RemindTask(ctx context.Context, id runtime.ID, nodeID string, 
 	if err := s.store.SaveIfVersion(ctx, st, st.Version); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func (s *Service) AddCCUsers(ctx context.Context, id runtime.ID, input workflowtypes.TaskActionInput) (*runtime.State, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "run"); err != nil {
 		return nil, err
 	}
 	id = runtime.ID(strings.TrimSpace(string(id)))
@@ -1050,7 +1053,7 @@ func (s *Service) AddCCUsers(ctx context.Context, id runtime.ID, input workflowt
 	if err != nil {
 		return nil, err
 	}
-	st, err := s.GetInstance(ctx, id)
+	st, err := s.getInstance(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1065,18 +1068,18 @@ func (s *Service) AddCCUsers(ctx context.Context, id runtime.ID, input workflowt
 	if err := s.store.SaveIfVersion(ctx, st, st.Version); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func (s *Service) WithdrawInstance(ctx context.Context, id runtime.ID, input workflowtypes.TaskActionInput) (*runtime.State, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "run"); err != nil {
 		return nil, err
 	}
 	id = runtime.ID(strings.TrimSpace(string(id)))
 	if id == "" {
 		return nil, errors.NewCode(errors.InvalidInput, "workflow instance id is empty")
 	}
-	st, err := s.GetInstance(ctx, id)
+	st, err := s.getInstance(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1101,7 +1104,7 @@ func (s *Service) WithdrawInstance(ctx context.Context, id runtime.ID, input wor
 	if err := s.store.SaveIfVersion(ctx, st, st.Version); err != nil {
 		return nil, err
 	}
-	return s.GetInstance(ctx, id)
+	return s.getInstance(ctx, id)
 }
 
 func applyWithdrawState(st *runtime.State, now time.Time) {
@@ -1361,7 +1364,7 @@ func removeInactiveAssignments(meta *workflowtypes.InstanceMetadata, activeNodeI
 }
 
 func (s *Service) getActiveTaskState(ctx context.Context, id runtime.ID, nodeID string) (*runtime.State, string, error) {
-	if err := s.validateReady(ctx); err != nil {
+	if err := s.validateExecution(ctx, "run"); err != nil {
 		return nil, "", err
 	}
 	id = runtime.ID(strings.TrimSpace(string(id)))
@@ -1372,7 +1375,7 @@ func (s *Service) getActiveTaskState(ctx context.Context, id runtime.ID, nodeID 
 	if nodeID == "" {
 		return nil, "", errors.NewCode(errors.InvalidInput, "workflow node id is empty")
 	}
-	st, err := s.GetInstance(ctx, id)
+	st, err := s.getInstance(ctx, id)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1930,6 +1933,9 @@ func (s *Service) validateReady(ctx context.Context) error {
 	if ctx == nil {
 		return errors.NewCode(errors.InvalidInput, "workflow context is nil")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s == nil || s.store == nil {
 		return errors.NewCode(errors.InvalidInput, "workflow service store is nil")
 	}
@@ -1946,4 +1952,20 @@ func (s *Service) validateReady(ctx context.Context) error {
 		return errors.NewCode(errors.InvalidInput, "workflow scope is required")
 	}
 	return validateScope(ScopeFromContext(ctx))
+}
+
+// GetDefinition 按当前主体的读取权限返回 Scope 内的最新定义。
+func (s *Service) GetDefinition(ctx context.Context, id string) (*workflowtypes.DesignerDefinition, error) {
+	if err := s.validateExecution(ctx, "read"); err != nil {
+		return nil, err
+	}
+	return s.getDefinition(ctx, id)
+}
+
+// GetInstance 按当前主体的读取权限返回 Scope 内的实例。
+func (s *Service) GetInstance(ctx context.Context, id runtime.ID) (*runtime.State, error) {
+	if err := s.validateExecution(ctx, "read"); err != nil {
+		return nil, err
+	}
+	return s.getInstance(ctx, id)
 }

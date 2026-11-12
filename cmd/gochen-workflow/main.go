@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	_ "modernc.org/sqlite"
+
 	workflow "gochen-workflow"
 	workflowservice "gochen-workflow/service"
 
@@ -119,6 +121,7 @@ func run(ctx context.Context, logger logging.ILogger) error {
 		hostconfig.WithLogger(logger),
 		hostconfig.WithContainer(container),
 		hostconfig.WithCatalogRegistrar(auth.NewCatalogRegistrar(authRegistry)),
+		hostconfig.WithEntryValidator(auth.NewEntryRegistry()),
 		hostconfig.WithAddress(hostName),
 		hostconfig.WithPort(port),
 		hostconfig.WithBasePath("/api/v1"),
@@ -312,7 +315,7 @@ func defaultStandaloneAuthConfig(environment string) *standaloneAuthConfig {
 		TokenHeader:     "Authorization",
 		TokenPrefix:     "Bearer ",
 		AllowQueryToken: allowQuery,
-		SkipPaths:       []string{"/health", "/ping", "/api/v1/health", "/api/v1/ping"},
+		SkipPaths:       []string{"/health", "/ping", "/api/v1/health", "/api/v1/ping", "/api/v1/healthz", "/api/v1/readyz"},
 	}
 }
 
@@ -526,11 +529,6 @@ func injectClaimsRequestContext(
 		if resolved == nil {
 			return nil, errors.NewCode(errors.InvalidInput, "resolved auth context is required")
 		}
-		baseCtx = auth.BindActiveScopeContext(baseCtx, resolved.ActiveScopeID, resolved.ActiveScopeKind)
-		baseCtx, err = scoped.WithDataScope(baseCtx, scoped.Filtered(resolved.VisibleScopeIDs...))
-		if err != nil {
-			return nil, err
-		}
 	}
 	principal := auth.Principal{
 		SubjectID:     strconv.FormatInt(claims.UserID, 10),
@@ -544,6 +542,14 @@ func injectClaimsRequestContext(
 	baseCtx, err = auth.WithPrincipal(baseCtx, principal)
 	if err != nil {
 		return nil, err
+	}
+	// 范围资料必须绑定到最终身份，建立 Principal 前的绑定会随身份切换失效。
+	if resolved != nil {
+		baseCtx = auth.BindActiveScopeContext(baseCtx, resolved.ActiveScopeID, resolved.ActiveScopeKind)
+		baseCtx, err = scoped.WithDataScope(baseCtx, scoped.Filtered(resolved.VisibleScopeIDs...))
+		if err != nil {
+			return nil, err
+		}
 	}
 	return reqCtx.WithContext(baseCtx), nil
 }

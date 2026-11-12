@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"gochen/auth/scoped"
 	"gochen/errors"
 	"gochen/gen/uuid"
 
@@ -120,6 +121,21 @@ func TestStandaloneAuthContextResolverAllowsScopedToken(t *testing.T) {
 	}
 	if got := auth.ActiveScopeKindFromContext(ctx.RequestContext()); got != string(auth.PermissionScopeTenant) {
 		t.Fatalf("active scope kind = %q, want %q", got, string(auth.PermissionScopeTenant))
+	}
+	dataScope, ok := scoped.DataScopeFromContext(ctx.RequestContext())
+	if !ok || dataScope.Kind != scoped.ScopeFiltered || len(dataScope.ScopeIDs) != 1 || dataScope.ScopeIDs[0] != 42 {
+		t.Fatalf("data scope = %+v, present = %v; want filtered scope 42", dataScope, ok)
+	}
+	// 已认证请求可读取范围资料，但切换主体不能继续沿用该资料。
+	changed, err := auth.WithPrincipal(ctx.RequestContext(), auth.Principal{SubjectID: "8", ActiveScopeID: 42})
+	if err != nil {
+		t.Fatalf("switch principal: %v", err)
+	}
+	if got := auth.ActiveScopeIDFromContext(changed); got != 0 {
+		t.Fatalf("active scope survived principal change: %d", got)
+	}
+	if _, ok := scoped.DataScopeFromContext(changed); ok {
+		t.Fatal("data scope survived principal change")
 	}
 }
 

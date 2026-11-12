@@ -2,6 +2,7 @@ package workflowservice_test
 
 import (
 	"context"
+	hostauthz "gochen-runtime/host/authz"
 	"testing"
 
 	workflowservice "gochen-workflow/service"
@@ -21,7 +22,11 @@ func (s *externalQueryStore) QueryDesigns(_ context.Context, query workflowtypes
 func TestExternalStoreCanProvideDefinitionQuery(t *testing.T) {
 	store := &externalQueryStore{}
 	service := workflowservice.NewService(store, nil, nil)
-	ctx := workflowservice.WithScope(context.Background(), workflowservice.Scope{Kind: workflowservice.ScopeKindTenant, ID: 1})
+	ctx, err := hostauthz.WithPrincipal(context.Background(), hostauthz.Principal{IsSystem: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = workflowservice.WithScope(ctx, workflowservice.Scope{Kind: workflowservice.ScopeKindTenant, ID: 1})
 	page, err := service.BuildDefinitionListResponseWithQuery(ctx, workflowtypes.DefinitionQuery{Keyword: " FLOW ", Page: 2, Size: 5})
 	if err != nil {
 		t.Fatal(err)

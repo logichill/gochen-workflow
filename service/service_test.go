@@ -21,7 +21,7 @@ import (
 )
 
 func TestServiceSavesPublishesAndRunsGraphWorkflow(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 
 	saved, err := service.SaveDefinition(ctx, sampleDesign())
@@ -98,7 +98,7 @@ func TestServiceSavesPublishesAndRunsGraphWorkflow(t *testing.T) {
 }
 
 func TestServiceRejectsPublishedDefinitionMutationAndDelete(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 
 	saved, err := service.SaveDefinition(ctx, sampleDesign())
@@ -120,7 +120,7 @@ func TestServiceRejectsPublishedDefinitionMutationAndDelete(t *testing.T) {
 }
 
 func TestServiceDeleteMissingDefinitionReturnsNotFound(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 
 	err := service.DeleteDefinition(ctx, "missing")
@@ -130,7 +130,7 @@ func TestServiceDeleteMissingDefinitionReturnsNotFound(t *testing.T) {
 }
 
 func TestServiceRejectsEmptyDefinitionID(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 
 	if _, err := service.GetDefinition(ctx, " "); err == nil || !errors.Is(err, errors.InvalidInput) {
@@ -142,7 +142,7 @@ func TestServiceRejectsEmptyDefinitionID(t *testing.T) {
 }
 
 func TestServiceRejectsEmptyInstanceID(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 
 	if _, err := service.GetInstance(ctx, " "); err == nil || !errors.Is(err, errors.InvalidInput) {
@@ -181,7 +181,7 @@ func TestServiceRejectsNilContextAndStore(t *testing.T) {
 }
 
 func TestServiceListDefinitionsSortsByUpdatedAtThenIDAndClonesResults(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	updatedAt := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
 	store := &listOnlyStore{designs: []*workflowtypes.DesignerDefinition{
 		{ID: "b", UpdatedAt: updatedAt},
@@ -213,7 +213,7 @@ func TestServiceListDefinitionsSortsByUpdatedAtThenIDAndClonesResults(t *testing
 }
 
 func TestServiceBuildDefinitionListResponseCountsStatuses(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store := &listOnlyStore{designs: []*workflowtypes.DesignerDefinition{
 		{ID: "draft", Status: workflowtypes.StatusDraft},
 		{ID: "published", Status: workflowtypes.StatusPublished},
@@ -237,7 +237,7 @@ func TestServiceBuildDefinitionListResponseCountsStatuses(t *testing.T) {
 }
 
 func TestServiceBuildDefinitionListResponseKeepsFullListSemantics(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store := NewMemoryStore()
 	service := newTestService(store)
 	for i := 0; i < 21; i++ {
@@ -258,7 +258,7 @@ func TestServiceBuildDefinitionListResponseKeepsFullListSemantics(t *testing.T) 
 }
 
 func TestServiceBuildDefinitionListResponseFiltersAndPaginates(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store := &listOnlyStore{designs: []*workflowtypes.DesignerDefinition{
 		{ID: "draft-a", Name: "Expense approval", Status: workflowtypes.StatusDraft, UpdatedAt: time.Now()},
 		{ID: "draft-b", Name: "Expense review", Status: workflowtypes.StatusDraft, UpdatedAt: time.Now().Add(-time.Minute)},
@@ -347,7 +347,7 @@ func TestServiceBuildDefinitionListResponseQueriesSQLitePage(t *testing.T) {
 
 func TestServiceBuildDefinitionListResponseRejectsOffsetOverflow(t *testing.T) {
 	service := newTestService(&listOnlyStore{})
-	_, err := service.BuildDefinitionListResponseWithQuery(context.Background(), workflowtypes.DefinitionQuery{
+	_, err := service.BuildDefinitionListResponseWithQuery(workflowTestContext(), workflowtypes.DefinitionQuery{
 		Page: math.MaxInt,
 		Size: 100,
 	})
@@ -365,14 +365,14 @@ func TestServiceInstanceAndWorkItemListsRejectOffsetOverflow(t *testing.T) {
 		{
 			name: "instances",
 			list: func() error {
-				_, err := service.ListInstances(context.Background(), workflowtypes.InstanceQuery{Page: math.MaxInt, Size: 2})
+				_, err := service.ListInstances(workflowTestContext(), workflowtypes.InstanceQuery{Page: math.MaxInt, Size: 2})
 				return err
 			},
 		},
 		{
 			name: "work items",
 			list: func() error {
-				_, err := service.ListTodoItemsByQuery(context.Background(), workflowtypes.WorkItemQuery{Page: math.MaxInt, Size: 2})
+				_, err := service.ListTodoItemsByQuery(workflowTestContext(), workflowtypes.WorkItemQuery{Page: math.MaxInt, Size: 2})
 				return err
 			},
 		},
@@ -387,7 +387,7 @@ func TestServiceInstanceAndWorkItemListsRejectOffsetOverflow(t *testing.T) {
 }
 
 func TestServiceGetDefinitionClonesStoreResult(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store := &nonCloningDesignStore{design: &workflowtypes.DesignerDefinition{
 		ID:          "stored",
 		Name:        "Stored",
@@ -426,7 +426,7 @@ func TestServiceGetDefinitionClonesStoreResult(t *testing.T) {
 }
 
 func TestServiceRejectsStaleDefinitionVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 
 	saved, err := service.SaveDefinition(ctx, sampleDesign())
@@ -446,7 +446,7 @@ func TestServiceRejectsStaleDefinitionVersion(t *testing.T) {
 }
 
 func TestServiceConcurrentDraftSavesRejectOneStaleVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 
 	saved, err := service.SaveDefinition(ctx, sampleDesign())
@@ -493,7 +493,7 @@ func TestServiceConcurrentDraftSavesRejectOneStaleVersion(t *testing.T) {
 }
 
 func TestServiceNormalizesExternalIDs(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 	input := sampleDesign()
 	input.ID = " onboarding-spaced "
@@ -525,7 +525,7 @@ func TestServiceNormalizesExternalIDs(t *testing.T) {
 }
 
 func TestServiceReturnedDesignAndStateDoNotShareNestedSliceMaps(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 	design := sampleDesign()
 	design.Nodes[0].UI = map[string]any{
@@ -569,7 +569,7 @@ func TestServiceReturnedDesignAndStateDoNotShareNestedSliceMaps(t *testing.T) {
 }
 
 func TestSQLiteStorePersistsDesignAndState(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -697,7 +697,7 @@ func TestServiceIsolatesDefinitionsAndInstancesByActiveScope(t *testing.T) {
 
 func TestServiceSeparatesPlatformAndTenantScopes(t *testing.T) {
 	tenantCtx := scopedContext(t, 101)
-	platformCtx := WithScope(context.Background(), Scope{Kind: ScopeKindPlatform, ID: 101})
+	platformCtx := WithScope(workflowTestContext(), Scope{Kind: ScopeKindPlatform, ID: 101})
 	tests := []struct {
 		name  string
 		store Store
@@ -747,7 +747,7 @@ func TestServiceSeparatesPlatformAndTenantScopes(t *testing.T) {
 }
 
 func TestServiceRejectsUnsupportedScopeKindAcrossStores(t *testing.T) {
-	ctx := WithScope(context.Background(), Scope{Kind: "department", ID: 101})
+	ctx := WithScope(workflowTestContext(), Scope{Kind: "department", ID: 101})
 	tests := []struct {
 		name  string
 		store Store
@@ -782,7 +782,7 @@ func TestServiceRejectsUnsupportedScopeKindAcrossStores(t *testing.T) {
 }
 
 func TestServiceRejectsTenantScopeWithoutID(t *testing.T) {
-	ctx := WithScope(context.Background(), Scope{Kind: ScopeKindTenant})
+	ctx := WithScope(workflowTestContext(), Scope{Kind: ScopeKindTenant})
 	tests := []struct {
 		name  string
 		store Store
@@ -817,7 +817,7 @@ func TestServiceRejectsTenantScopeWithoutID(t *testing.T) {
 }
 
 func TestStoreSaveDesignRejectsStaleDefinitionVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	stores := []struct {
 		name  string
 		store Store
@@ -867,7 +867,7 @@ func TestStoreSaveDesignRejectsStaleDefinitionVersion(t *testing.T) {
 }
 
 func TestStoreSaveDesignRejectsMismatchedRuntimeDefinitionID(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	stores := []struct {
 		name  string
 		store Store
@@ -906,7 +906,7 @@ func TestStoreSaveDesignRejectsMismatchedRuntimeDefinitionID(t *testing.T) {
 }
 
 func TestMemoryStoreRuntimeSaveDefinitionSynthesizesDesign(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store := NewMemoryStore()
 	def := &runtime.Definition{
 		ID:          "memory-runtime",
@@ -937,7 +937,7 @@ func TestMemoryStoreRuntimeSaveDefinitionSynthesizesDesign(t *testing.T) {
 }
 
 func TestSQLiteStoreRuntimeSaveDefinitionPreservesExplicitNodeKinds(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -992,7 +992,7 @@ func TestSQLiteStoreRuntimeSaveDefinitionPreservesExplicitNodeKinds(t *testing.T
 }
 
 func TestSQLiteStoreRuntimeSaveDefinitionRefreshesDesignSnapshot(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -1046,7 +1046,7 @@ func TestSQLiteStoreRuntimeSaveDefinitionRefreshesDesignSnapshot(t *testing.T) {
 }
 
 func TestSQLiteStoreRuntimeSaveDefinitionPreservesDraftPublishedAtNil(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -1086,7 +1086,7 @@ func TestSQLiteStoreRuntimeSaveDefinitionPreservesDraftPublishedAtNil(t *testing
 }
 
 func TestMemoryStoreRuntimeSaveDefinitionPreservesDraftPublishedAtNil(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store := NewMemoryStore()
 	service := newTestService(store)
 	saved, err := service.SaveDefinition(ctx, sampleDesign())
@@ -1121,7 +1121,7 @@ func TestMemoryStoreRuntimeSaveDefinitionPreservesDraftPublishedAtNil(t *testing
 }
 
 func TestSQLiteStoreRuntimeSaveDefinitionGeneratesUniqueEdgeIDs(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -1160,7 +1160,7 @@ func TestSQLiteStoreRuntimeSaveDefinitionGeneratesUniqueEdgeIDs(t *testing.T) {
 }
 
 func TestSQLiteStoreRejectsStaleInstanceVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -1197,7 +1197,7 @@ func TestSQLiteStoreRejectsStaleInstanceVersion(t *testing.T) {
 }
 
 func TestSQLiteStoreSaveIfVersionMissingInstanceReturnsDoesNotExist(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	store, err := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "workflow.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -1233,7 +1233,7 @@ func TestSQLiteStoreUsesSingleConnectionForForeignKeyPragma(t *testing.T) {
 }
 
 func TestSQLiteStoreMigratesManagedScopeColumnsOnLegacySchema(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -1295,7 +1295,7 @@ func TestSQLiteStoreMigratesManagedScopeColumnsOnLegacySchema(t *testing.T) {
 }
 
 func TestSQLiteStoreMigratesLegacyScopePrimaryKeys(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -1355,7 +1355,7 @@ func TestSQLiteStoreMigratesLegacyScopePrimaryKeys(t *testing.T) {
 	}
 	defer store.Close()
 	service := newTestService(store)
-	if _, err := service.GetDefinition(context.Background(), legacyDesign.ID); err != nil {
+	if _, err := service.GetDefinition(WithScope(workflowTestContext(), Scope{Kind: ScopeKindPlatform}), legacyDesign.ID); err != nil {
 		t.Fatalf("legacy platform definition should remain readable: %v", err)
 	}
 	tenantDesign := sampleDesign()
@@ -1368,7 +1368,7 @@ func TestSQLiteStoreMigratesLegacyScopePrimaryKeys(t *testing.T) {
 }
 
 func TestSQLiteStoreMigratesLegacyScopePrimaryKeysWithInstances(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	dbPath := filepath.Join(t.TempDir(), "legacy-with-instances.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -1467,7 +1467,7 @@ func TestSQLiteStoreMigratesLegacyScopePrimaryKeysWithInstances(t *testing.T) {
 }
 
 func TestSQLiteStoreMigratedLegacyInstancesStillRestrictDefinitionDelete(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	dbPath := filepath.Join(t.TempDir(), "legacy-delete-restrict.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -1558,7 +1558,7 @@ func TestSQLiteStoreMigratedLegacyInstancesStillRestrictDefinitionDelete(t *test
 
 func TestSQLiteStoreLegacyScopeMigrationRejectsCollisionsAtomically(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy-collision.db")
-	ctx := context.Background()
+	ctx := WithScope(workflowTestContext(), Scope{Kind: ScopeKindPlatform})
 	store, err := OpenSQLiteStore(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -1595,7 +1595,7 @@ func TestSQLiteStoreLegacyScopeMigrationRejectsCollisionsAtomically(t *testing.T
 }
 
 func TestRejectsInvalidRuntimeGraph(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 	input := sampleDesign()
 	input.Edges = input.Edges[:1]
@@ -1605,7 +1605,7 @@ func TestRejectsInvalidRuntimeGraph(t *testing.T) {
 }
 
 func TestServiceRejectsDuplicateNodeNextBeforeNormalize(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 	input := &workflowtypes.DesignerDefinition{
 		ID:          "duplicate-node-next",
@@ -1623,7 +1623,7 @@ func TestServiceRejectsDuplicateNodeNextBeforeNormalize(t *testing.T) {
 }
 
 func TestServiceListsTodoAndDoneWorkItems(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 	saved, err := service.SaveDefinition(ctx, sampleDesign())
 	if err != nil {
@@ -1671,7 +1671,7 @@ func TestServiceListsTodoAndDoneWorkItems(t *testing.T) {
 }
 
 func TestServiceWorkItemPagination(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	service := newTestService(NewMemoryStore())
 	saved, err := service.SaveDefinition(ctx, sampleDesign())
 	if err != nil {
@@ -1704,7 +1704,7 @@ func TestServiceWorkItemPagination(t *testing.T) {
 
 func TestServiceWorkflowCenterPersonalListsAndActions(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, sampleDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -1780,7 +1780,7 @@ func TestServiceWorkflowCenterPersonalListsAndActions(t *testing.T) {
 
 func TestServiceListMyStartedInstancesExcludesPendingInstances(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, sampleDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -1838,7 +1838,7 @@ func TestServiceListMyStartedInstancesExcludesPendingInstances(t *testing.T) {
 
 func TestServiceListMyTodoItemsIncludesCandidateRoles(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, sampleDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -1886,7 +1886,7 @@ func TestServiceWorkflowCenterRejectsMissingPrincipalForMine(t *testing.T) {
 
 func TestServiceWorkflowActionsRequireAuthorizedPrincipal(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, sampleDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -1944,7 +1944,7 @@ func TestServiceWorkflowActionsRequireAuthorizedPrincipal(t *testing.T) {
 
 func TestServiceRejectNodeReactivatesTargetAndRecordsMetadata(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, rejectableLinearDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -2017,7 +2017,7 @@ func TestServiceRejectNodeReactivatesTargetAndRecordsMetadata(t *testing.T) {
 
 func TestServiceRejectNodeRequiresAuthorizedPrincipal(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, rejectableLinearDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -2065,7 +2065,7 @@ func TestServiceRejectNodeRequiresAuthorizedPrincipal(t *testing.T) {
 
 func TestServiceWithdrawInstanceByInitiator(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, sampleDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -2115,7 +2115,7 @@ func TestServiceWithdrawInstanceByInitiator(t *testing.T) {
 
 func TestServiceWorkflowCenterSLADelegationReminderAndCC(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, sampleDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -2198,7 +2198,7 @@ func TestServiceWorkflowCenterSLADelegationReminderAndCC(t *testing.T) {
 
 func TestServiceTransferAndDelegateRecordOperatorNameInMetadata(t *testing.T) {
 	service := newTestService(NewMemoryStore())
-	baseCtx := context.Background()
+	baseCtx := workflowTestContext()
 	saved, err := service.SaveDefinition(baseCtx, sampleDesign())
 	if err != nil {
 		t.Fatalf("save definition: %v", err)
@@ -2320,7 +2320,7 @@ func runtimeDefinitionForTest(t *testing.T, design *workflowtypes.DesignerDefini
 
 func scopedContext(t *testing.T, scopeID int64) context.Context {
 	t.Helper()
-	return WithScope(context.Background(), Scope{Kind: ScopeKindTenant, ID: scopeID})
+	return WithScope(workflowTestContext(), Scope{Kind: ScopeKindTenant, ID: scopeID})
 }
 
 func principalContext(t *testing.T, userID int64) context.Context {
@@ -2329,11 +2329,11 @@ func principalContext(t *testing.T, userID int64) context.Context {
 
 func principalContextWithRoles(t *testing.T, userID int64, roles []string) context.Context {
 	t.Helper()
-	ctx, err := auth.WithPrincipal(context.Background(), auth.Principal{SubjectID: strconv.FormatInt(userID, 10), ActiveScopeID: 1, Roles: roles})
+	ctx, err := auth.WithPrincipal(workflowTestContext(), auth.Principal{SubjectID: strconv.FormatInt(userID, 10), ActiveScopeID: 1, Roles: roles, Permissions: []string{"workflow:api:*"}, PermissionScopes: []string{ScopeKindPlatform}})
 	if err != nil {
 		t.Fatalf("with principal: %v", err)
 	}
-	return ctx
+	return auth.BindActiveScopeContext(ctx, 1, ScopeKindPlatform)
 }
 
 func sqliteColumnExists(t *testing.T, db *sql.DB, table string, column string) bool {
@@ -2420,7 +2420,7 @@ func TestStore_MultiVersionDefinitionRetrievalAndInstanceRecovery(t *testing.T) 
 			return NewMemoryStore()
 		},
 		"sqlite": func(t *testing.T) Store {
-			ctx := context.Background()
+			ctx := workflowTestContext()
 			dbPath := filepath.Join(t.TempDir(), "test_ver.db")
 			store, err := OpenSQLiteStore(ctx, dbPath)
 			if err != nil {
@@ -2434,7 +2434,7 @@ func TestStore_MultiVersionDefinitionRetrievalAndInstanceRecovery(t *testing.T) 
 	for name, factory := range testStores {
 		t.Run(name, func(t *testing.T) {
 			store := factory(t)
-			ctx := context.Background()
+			ctx := workflowTestContext()
 
 			// 1. 保存并发布 v1
 			v1Design := sampleDesign()
@@ -2585,7 +2585,7 @@ func TestService_V1InstanceExecutesV1DefinitionAfterV2Published(t *testing.T) {
 			return NewMemoryStore()
 		},
 		"sqlite": func(t *testing.T) Store {
-			ctx := context.Background()
+			ctx := workflowTestContext()
 			dbPath := filepath.Join(t.TempDir(), "test_service_ver.db")
 			store, err := OpenSQLiteStore(ctx, dbPath)
 			if err != nil {
@@ -2600,7 +2600,7 @@ func TestService_V1InstanceExecutesV1DefinitionAfterV2Published(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			store := factory(t)
 			service := newTestService(store)
-			ctx := context.Background()
+			ctx := workflowTestContext()
 
 			// 1. 创建并发布 v1 定义: start -> review -> approve
 			v1Design := &workflowtypes.DesignerDefinition{
@@ -2696,7 +2696,7 @@ func TestService_V1InstanceExecutesV1DefinitionAfterV2Published(t *testing.T) {
 }
 
 func TestSQLiteStoreMigratesLegacyNextToEdges(t *testing.T) {
-	ctx := context.Background()
+	ctx := WithScope(workflowTestContext(), Scope{Kind: ScopeKindPlatform})
 	dbPath := filepath.Join(t.TempDir(), "legacy-edges.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -2760,7 +2760,7 @@ func TestSQLiteStoreMigratesLegacyNextToEdges(t *testing.T) {
 }
 
 func TestSQLiteStoreMigrationPinsLegacyInstancesToDefinitionVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := WithScope(workflowTestContext(), Scope{Kind: ScopeKindPlatform})
 	dbPath := filepath.Join(t.TempDir(), "legacy-instance-version.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -2852,7 +2852,7 @@ func (m *mockFailIDGen) Next() (string, error) {
 }
 
 func TestServiceStoreFailureInjection(t *testing.T) {
-	ctx := context.Background()
+	ctx := workflowTestContext()
 	injectedErr := errors.New("database disconnected")
 
 	// 1. SaveDesign failure
@@ -2903,14 +2903,17 @@ func TestServiceStoreFailureInjection(t *testing.T) {
 		failSaveIfVersion: injectedErr,
 	}
 	svc = newTestService(failStore)
-	adminCtx, err := auth.WithPrincipal(context.Background(), auth.Principal{
-		SubjectID:     "1",
-		ActiveScopeID: 1,
-		Roles:         []string{"admin"},
+	adminCtx, err := auth.WithPrincipal(workflowTestContext(), auth.Principal{
+		SubjectID:        "1",
+		ActiveScopeID:    1,
+		Roles:            []string{"admin"},
+		Permissions:      []string{"workflow:api:*"},
+		PermissionScopes: []string{ScopeKindPlatform},
 	})
 	if err != nil {
 		t.Fatalf("setup auth principal: %v", err)
 	}
+	adminCtx = auth.BindActiveScopeContext(adminCtx, 1, ScopeKindPlatform)
 	_, err = svc.ClaimTask(adminCtx, inst.ID, "start", workflowtypes.TaskActionInput{})
 	if !errors.Is(err, injectedErr) {
 		t.Fatalf("expected injected SaveIfVersion failure during ClaimTask, got %v", err)

@@ -65,14 +65,15 @@ func PermissionMiddleware(required auth.PermissionSpec) httpx.Middleware {
 		if ctx == nil || ctx.RequestContext() == nil {
 			return errors.NewCode(errors.Unauthorized, "用户未认证")
 		}
-		if err := requirePermission(ctx.RequestContext(), requiredPermission); err != nil {
+		if err := RequirePermission(ctx.RequestContext(), requiredPermission); err != nil {
 			return err
 		}
 		return next()
 	}
 }
 
-func requirePermission(ctx context.Context, required auth.PermissionDefinition) error {
+// RequirePermission checks workflow permission codes and the trusted permission domain.
+func RequirePermission(ctx context.Context, required auth.PermissionDefinition) error {
 	principal, err := auth.RequirePrincipal(ctx)
 	if err != nil {
 		return errors.NewCode(errors.Unauthorized, "用户未认证")
@@ -102,4 +103,3 @@ func matchesPermissionScopes(ctx context.Context, principal auth.Principal, requ
 	// 不能默认放行——该包是公共 API，无法假设宿主装配一定注入了授权域。
 	return false
 }
-

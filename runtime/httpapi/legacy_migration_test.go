@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	hostauthz "gochen-runtime/host/authz"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,7 +16,11 @@ import (
 
 func TestLegacyScopeMigrationMakesDataReachableOnlyInExplicitHTTPScope(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "workflow.db")
-	ctx := context.Background()
+	ctx, err := hostauthz.WithPrincipal(context.Background(), hostauthz.Principal{IsSystem: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = workflowservice.WithScope(ctx, workflowservice.Scope{Kind: workflowservice.ScopeKindPlatform})
 	legacyStore, err := workflowservice.OpenSQLiteStore(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("open legacy store: %v", err)

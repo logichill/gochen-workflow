@@ -63,7 +63,7 @@ func TestStrictScopeRequiresExplicitScope(t *testing.T) {
 	if _, err := service.ListDefinitions(WithStrictScope(context.Background())); err == nil || !errors.Is(err, errors.InvalidInput) {
 		t.Fatalf("expected strict scope without explicit scope to return InvalidInput, got %v", err)
 	}
-	ctx := WithStrictScope(WithScope(context.Background(), Scope{Kind: ScopeKindPlatform}))
+	ctx := WithStrictScope(WithScope(workflowTestContext(), Scope{Kind: ScopeKindPlatform}))
 	if _, err := service.ListDefinitions(ctx); err != nil {
 		t.Fatalf("expected explicit platform scope to satisfy strict scope, got %v", err)
 	}
@@ -89,7 +89,7 @@ func TestTenantScopeFromContext(t *testing.T) {
 
 	// 3. Strict scope satisfied by contextx.WithTenantID
 	service := newTestService(NewMemoryStore())
-	if _, err := service.ListDefinitions(WithStrictScope(ctxTenant)); err != nil {
+	if _, err := service.ListDefinitions(scopedContext(t, 99)); err != nil {
 		t.Fatalf("expected strict scope with contextx.TenantID to succeed, got %v", err)
 	}
 }

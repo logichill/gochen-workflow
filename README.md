@@ -35,7 +35,11 @@ go run ./cmd/gochen-workflow
 
 `GOCHEN_WORKFLOW_SQLITE_DSN` 为空时，默认写入 `file:gochen-workflow.db`。
 独立服务内置 HS256 JWT 鉴权中间件；除 health/ping 等跳过路径外，API 请求需要携带 `Authorization: Bearer <token>`。
-本地联调时应保证 token 由相同 `AUTH_SECRET` 签发，并包含 `active_scope_id` 与对应 API 权限；独立服务会将 `active_scope_id` 作为当前租户级 scope。宿主模块接入时，HTTP 层会把 `gochen-runtime/host/authz` 的 active scope 映射为 workflow service scope，service/store 只按轻量 scope 上下文做数据隔离。
+本地联调时应保证 token 由相同 `AUTH_SECRET` 签发，并包含 `active_scope_id` 与对应 API 权限；独立服务会将 `active_scope_id` 作为当前租户级 scope。宿主模块接入时，HTTP 层把 `gochen-runtime/host/authz` 的 active scope 映射为 workflow service scope。普通 `Service` 通过编译计划统一校验可信身份、read/design/run 权限和明确的 Scope，再访问 Store；普通主体的 Scope 类型和 ID 必须与可信 active scope 一致。直接服务调用也需由可信组合根建立这些上下文。
+
+设计和运行操作中的内部读取复用该次操作权限。公开读取入口要求 read 权限，操作人及对象状态规则继续独立校验。`Service.AuthorizationBinding` 提供 read/design/run 执行绑定；ERP 内部协作沿用 `SystemExecution`，保持 System、租户与严格 tenant Scope 约束。历史 `platform/0` 数据可由显式绑定该 Scope 的可信 System 进行迁移和验证。
+
+直接调用 `CreateInstanceWithOptions` 时，普通主体的显式发起人须等于当前认证主体；可信 System 可以代表已知发起人执行。
 
 旧版本未启用 scope 的 SQLite 数据会迁移到 `platform/0`，不会被任何 HTTP tenant 自动认领。确认数据归属后，使用 `GOCHEN_WORKFLOW_LEGACY_SCOPE_ID=<positive-id>` 启动一次服务，将这些记录原子迁移到当前 `GOCHEN_WORKFLOW_SCOPE_KIND`（未设置时为 `tenant`）和指定 ID；目标 scope 已存在同 ID 记录时迁移会失败并回滚。
 

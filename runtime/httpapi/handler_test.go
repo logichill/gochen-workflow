@@ -1342,12 +1342,11 @@ func doRequestWithScope(t *testing.T, handler httpx.Handler, params map[string]s
 		t.Fatalf("new context: %v", err)
 	}
 	if scopeID > 0 || strings.TrimSpace(scopeKind) != "" {
-		reqCtx := auth.BindActiveScopeContext(ctx.RequestContext(), scopeID, scopeKind)
-		var principalErr error
-		reqCtx, principalErr = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: "1001", ActiveScopeID: scopeID})
+		reqCtx, principalErr := auth.WithPrincipal(ctx.RequestContext(), auth.Principal{SubjectID: "1001", ActiveScopeID: scopeID, Permissions: []string{workflowpermissions.WorkflowReadCode, workflowpermissions.WorkflowDesignCode, workflowpermissions.WorkflowRunCode}})
 		if principalErr != nil {
 			t.Fatalf("with principal: %v", principalErr)
 		}
+		reqCtx = auth.BindActiveScopeContext(reqCtx, scopeID, scopeKind)
 		ctx.SetContext(ctx.RequestContext().WithContext(reqCtx))
 	}
 	for key, value := range params {
@@ -1366,11 +1365,11 @@ func doRequestAsUser(t *testing.T, handler httpx.Handler, params map[string]stri
 	if err != nil {
 		t.Fatalf("new context: %v", err)
 	}
-	reqCtx := auth.BindActiveScopeContext(ctx.RequestContext(), 1, "tenant")
-	reqCtx, err = auth.WithPrincipal(reqCtx, auth.Principal{SubjectID: strconv.FormatInt(userID, 10), ActiveScopeID: 1})
+	reqCtx, err := auth.WithPrincipal(ctx.RequestContext(), auth.Principal{SubjectID: strconv.FormatInt(userID, 10), ActiveScopeID: 1, Permissions: []string{workflowpermissions.WorkflowReadCode, workflowpermissions.WorkflowDesignCode, workflowpermissions.WorkflowRunCode}})
 	if err != nil {
 		t.Fatalf("with principal: %v", err)
 	}
+	reqCtx = auth.BindActiveScopeContext(reqCtx, 1, "tenant")
 	ctx.SetContext(ctx.RequestContext().WithContext(reqCtx))
 	for key, value := range params {
 		ctx.SetParam(key, value)
@@ -1407,7 +1406,11 @@ func generateWorkflowToken(t *testing.T, permissions []string) string {
 
 func workflowTestScopeContext(t *testing.T) context.Context {
 	t.Helper()
-	return workflowservice.WithScope(t.Context(), workflowservice.Scope{Kind: workflowservice.ScopeKindTenant, ID: 1})
+	ctx, err := auth.WithPrincipal(t.Context(), auth.Principal{IsSystem: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return workflowservice.WithScope(ctx, workflowservice.Scope{Kind: workflowservice.ScopeKindTenant, ID: 1})
 }
 
 func workflowTestAuthMiddleware() httpx.Middleware {
@@ -1421,8 +1424,7 @@ func workflowTestAuthMiddleware() httpx.Middleware {
 		if err := json.Unmarshal([]byte(rawPerms), &perms); err != nil {
 			return err
 		}
-		baseCtx := auth.BindActiveScopeContext(ctx.RequestContext(), 1, string(auth.PermissionScopePlatform))
-		baseCtx, err := auth.WithPrincipal(baseCtx, auth.Principal{
+		baseCtx, err := auth.WithPrincipal(ctx.RequestContext(), auth.Principal{
 			SubjectID:        "1",
 			ActiveScopeID:    1,
 			Permissions:      perms,
@@ -1431,6 +1433,7 @@ func workflowTestAuthMiddleware() httpx.Middleware {
 		if err != nil {
 			return err
 		}
+		baseCtx = auth.BindActiveScopeContext(baseCtx, 1, string(auth.PermissionScopePlatform))
 		ctx.SetContext(ctx.RequestContext().WithContext(baseCtx))
 		return next()
 	}

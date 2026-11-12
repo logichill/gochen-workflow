@@ -13,7 +13,7 @@ import (
 func TestDoneHistoryKeepsActorsAtIdenticalTimes(t *testing.T) {
 	for _, kind := range []string{"memory", "sqlite"} {
 		t.Run(kind, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := workflowTestContext()
 			var store Store = NewMemoryStore()
 			if kind == "sqlite" {
 				db, e := OpenSQLiteStore(ctx, filepath.Join(t.TempDir(), "done.db"))

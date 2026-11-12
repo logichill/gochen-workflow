@@ -8,6 +8,7 @@ import (
 
 	"gochen-runtime/api/rest"
 	auth "gochen-runtime/host/authz"
+	runtimehttp "gochen-runtime/http"
 	workflowpermissions "gochen-workflow/permissions"
 	workflowservice "gochen-workflow/service"
 	workflowtypes "gochen-workflow/types"
@@ -18,14 +19,17 @@ import (
 
 // Registrar 将 workflow 业务接口挂载到 GoChen httpx 路由组。
 type Registrar struct {
-	service *workflowservice.Service
+	service   *workflowservice.Service
+	execution *scopeExecution
+	initErr   error
 }
 
 var workflowPageQueryConfig = rest.NewQueryRouteConfig[string](nil, 20, 0)
 
 // NewRegistrar 创建 workflow HTTP 路由注册器。
 func NewRegistrar(service *workflowservice.Service) *Registrar {
-	return &Registrar{service: service}
+	execution, err := newScopeExecution()
+	return &Registrar{service: service, execution: execution, initErr: err}
 }
 
 // RegisterRoutes 注册 workflow definitions 与 instances API。
@@ -37,47 +41,31 @@ func (r *Registrar) RegisterRoutes(group httpx.IRouteGroup) error {
 		return errors.NewCode(errors.InvalidInput, "workflow route group is nil")
 	}
 
-	readDefinitions := group.Group("/definitions").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRead))
-	readDefinitions.GET("", r.listDefinitions)
-	readDefinitions.GET("/:id", r.getDefinition)
-
-	writeDefinitions := group.Group("/definitions").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowDesign))
-	writeDefinitions.POST("", r.createDefinition)
-	writeDefinitions.PUT("/:id", r.updateDefinition)
-	writeDefinitions.DELETE("/:id", r.deleteDefinition)
-	writeDefinitions.POST("/:id/publish", r.publishDefinition)
-	writeDefinitions.POST("/:id/archive", r.archiveDefinition)
-
-	readInstances := group.Group("/instances").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRead))
-	readInstances.GET("", r.listInstances)
-	readInstances.GET("/:id", r.getInstance)
-
-	readWorkItems := group.Group("").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRead))
-	readWorkItems.GET("/todos", r.listTodos)
-	readWorkItems.GET("/done", r.listDone)
-	readWorkItems.GET("/started", r.listStarted)
-	readWorkItems.GET("/my/todos", r.listMyTodos)
-	readWorkItems.GET("/my/done", r.listMyDone)
-	readWorkItems.GET("/my/started", r.listMyStarted)
-
-	runInstances := group.Group("/instances").Use(workflowpermissions.PermissionMiddleware(workflowpermissions.WorkflowRun))
-	runInstances.POST("", r.createInstance)
-	runInstances.POST("/:id/start", r.startInstance)
-	runInstances.POST("/:id/nodes/:node_id/advance", r.advanceNode)
-	runInstances.POST("/:id/nodes/:node_id/complete", r.completeNode)
-	runInstances.POST("/:id/nodes/:node_id/reject", r.rejectNode)
-	runInstances.POST("/:id/nodes/:node_id/claim", r.claimTask)
-	runInstances.POST("/:id/nodes/:node_id/unclaim", r.unclaimTask)
-	runInstances.POST("/:id/nodes/:node_id/transfer", r.transferTask)
-	runInstances.POST("/:id/nodes/:node_id/delegate", r.delegateTask)
-	runInstances.POST("/:id/nodes/:node_id/remind", r.remindTask)
-	runInstances.POST("/:id/cc", r.addCCUsers)
-	runInstances.POST("/:id/withdraw", r.withdrawInstance)
+	if r.initErr != nil {
+		return r.initErr
+	}
+	for _, declaration := range workflowRoutes {
+		routes := group.Group(declaration.prefix).Use(workflowpermissions.PermissionMiddleware(declaration.permission))
+		registry, _, err := runtimehttp.EntryRegistryFrom(routes)
+		if err != nil {
+			return err
+		}
+		for _, route := range declaration.routes {
+			handler := func(ctx httpx.IContext) error { return route.handler(r, ctx) }
+			if registry != nil {
+				if err := runtimehttp.RegisterDeclaredRoute(routes, route.method, route.path, handler, r.execution, route.action); err != nil {
+					return err
+				}
+			} else if err := runtimehttp.RegisterRoute(routes, route.method, route.path, handler); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
 func (r *Registrar) listDefinitions(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "definition_list")
 	if err != nil {
 		return err
 	}
@@ -106,7 +94,7 @@ func definitionQuery(ctx httpx.IContext) (workflowtypes.DefinitionQuery, error) 
 }
 
 func (r *Registrar) createDefinition(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "definition_create")
 	if err != nil {
 		return err
 	}
@@ -122,7 +110,7 @@ func (r *Registrar) createDefinition(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) getDefinition(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "definition_read")
 	if err != nil {
 		return err
 	}
@@ -138,7 +126,7 @@ func (r *Registrar) getDefinition(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) updateDefinition(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "definition_update")
 	if err != nil {
 		return err
 	}
@@ -159,7 +147,7 @@ func (r *Registrar) updateDefinition(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) deleteDefinition(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "definition_delete")
 	if err != nil {
 		return err
 	}
@@ -174,7 +162,7 @@ func (r *Registrar) deleteDefinition(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) publishDefinition(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "definition_publish")
 	if err != nil {
 		return err
 	}
@@ -190,7 +178,7 @@ func (r *Registrar) publishDefinition(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) archiveDefinition(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "definition_archive")
 	if err != nil {
 		return err
 	}
@@ -206,7 +194,7 @@ func (r *Registrar) archiveDefinition(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) createInstance(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_create")
 	if err != nil {
 		return err
 	}
@@ -228,7 +216,7 @@ func (r *Registrar) createInstance(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) getInstance(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_read")
 	if err != nil {
 		return err
 	}
@@ -244,7 +232,7 @@ func (r *Registrar) getInstance(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) listInstances(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_list")
 	if err != nil {
 		return err
 	}
@@ -260,7 +248,7 @@ func (r *Registrar) listInstances(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) startInstance(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_start")
 	if err != nil {
 		return err
 	}
@@ -284,7 +272,7 @@ func (r *Registrar) completeNode(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) completeNodeWithAction(ctx httpx.IContext, action string) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_"+action)
 	if err != nil {
 		return err
 	}
@@ -353,7 +341,7 @@ func (r *Registrar) completeNodeWithAction(ctx httpx.IContext, action string) er
 }
 
 func (r *Registrar) rejectNode(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_reject")
 	if err != nil {
 		return err
 	}
@@ -397,7 +385,7 @@ func (r *Registrar) remindTask(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) taskAction(ctx httpx.IContext, action string) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_"+action)
 	if err != nil {
 		return err
 	}
@@ -435,7 +423,7 @@ func (r *Registrar) taskAction(ctx httpx.IContext, action string) error {
 }
 
 func (r *Registrar) addCCUsers(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_cc")
 	if err != nil {
 		return err
 	}
@@ -455,7 +443,7 @@ func (r *Registrar) addCCUsers(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) withdrawInstance(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "instance_withdraw")
 	if err != nil {
 		return err
 	}
@@ -475,7 +463,7 @@ func (r *Registrar) withdrawInstance(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) listTodos(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "todos")
 	if err != nil {
 		return err
 	}
@@ -491,7 +479,7 @@ func (r *Registrar) listTodos(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) listMyTodos(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "my_todos")
 	if err != nil {
 		return err
 	}
@@ -507,7 +495,7 @@ func (r *Registrar) listMyTodos(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) listDone(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "done")
 	if err != nil {
 		return err
 	}
@@ -523,7 +511,7 @@ func (r *Registrar) listDone(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) listMyDone(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "my_done")
 	if err != nil {
 		return err
 	}
@@ -539,7 +527,7 @@ func (r *Registrar) listMyDone(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) listStarted(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "started")
 	if err != nil {
 		return err
 	}
@@ -555,7 +543,7 @@ func (r *Registrar) listStarted(ctx httpx.IContext) error {
 }
 
 func (r *Registrar) listMyStarted(ctx httpx.IContext) error {
-	serviceCtx, err := r.serviceContext(ctx)
+	serviceCtx, err := r.serviceContext(ctx, "my_started")
 	if err != nil {
 		return err
 	}
@@ -671,19 +659,11 @@ func instanceQuery(ctx httpx.IContext) (workflowtypes.InstanceQuery, error) {
 	}, nil
 }
 
-func (r *Registrar) serviceContext(ctx httpx.IContext) (context.Context, error) {
-	reqCtx := ctx.RequestContext()
-	scopeID := auth.ActiveScopeIDFromContext(reqCtx)
-	scopeKind := auth.ActiveScopeKindFromContext(reqCtx)
-	if scopeID <= 0 || strings.TrimSpace(scopeKind) == "" {
-		return nil, errors.NewCode(errors.Unauthorized, "workflow active scope is required")
+func (r *Registrar) serviceContext(ctx httpx.IContext, action string) (context.Context, error) {
+	if r.initErr != nil {
+		return nil, r.initErr
 	}
-	scopeKind = strings.ToLower(strings.TrimSpace(scopeKind))
-	if scopeKind != workflowservice.ScopeKindPlatform && scopeKind != workflowservice.ScopeKindTenant {
-		return nil, errors.NewCode(errors.Forbidden, "workflow active scope is unsupported").
-			WithContext("scope_kind", scopeKind)
-	}
-	return workflowservice.WithStrictScope(workflowservice.WithScope(reqCtx, workflowservice.Scope{Kind: scopeKind, ID: scopeID})), nil
+	return r.execution.context(ctx.RequestContext(), action)
 }
 
 func requiredParam(ctx httpx.IContext, key string) string {
